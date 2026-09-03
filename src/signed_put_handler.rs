@@ -3113,7 +3113,7 @@ impl SignedPutHandler {
     /// # Requirements (write-through-cache-finalization)
     ///
     /// - Requirement 1.1: Store object data as single range (0 to content-length-1)
-    /// - Requirement 1.2: Create metadata with ETag and Content-Type from S3 response (Last-Modified learned on first cache-miss GET or first HEAD after PUT)
+    /// - Requirement 1.2: Create metadata with ETag and Content-Type from S3 response (Last-Modified learned by conditional validation on the first GET, or by the first HEAD after PUT)
     /// - Requirement 1.3: Set write cache TTL (default: 1 day)
     /// - Requirement 1.5: Return S3 response unchanged to client (handled by caller)
     /// - Requirement 9.1: Don't cache on S3 failure

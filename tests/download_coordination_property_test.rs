@@ -1931,6 +1931,20 @@ fn prop_waiter_conditional_headers_well_formed(seed: u64) -> TestResult {
     rt.block_on(async move { run_waiter_conditional_headers_well_formed(seed).await })
 }
 
+/// Regression for twox-hash issue #120. This generated object length made
+/// twox-hash 2.1.2 panic while finalizing the LZ4 content checksum in test builds.
+#[test]
+fn waiter_conditional_headers_xxhash_length_overflow_regression() {
+    const OVERFLOWING_SEED: u64 = 5_541_312_589_062_984_930;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let result = rt.block_on(run_waiter_conditional_headers_well_formed(OVERFLOWING_SEED));
+    assert!(
+        !result.is_failure(),
+        "fixed property case failed: {result:?}"
+    );
+}
+
 /// Core logic for the conditional-headers-well-formed property test.
 async fn run_waiter_conditional_headers_well_formed(seed: u64) -> TestResult {
     // Derive ETag variant from seed.

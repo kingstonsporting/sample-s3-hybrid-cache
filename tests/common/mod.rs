@@ -126,9 +126,13 @@ impl StubResponse {
     /// Build a 304 Not Modified response. S3 returns 304 with the ETag and
     /// Last-Modified of the current object but no body.
     pub fn not_modified() -> Self {
+        let headers = HashMap::from([(
+            "last-modified".to_string(),
+            "Wed, 01 Jan 2025 00:00:00 GMT".to_string(),
+        )]);
         Self {
             status: StatusCode::NOT_MODIFIED,
-            headers: HashMap::new(),
+            headers,
             body: None,
             delay: Duration::ZERO,
         }

@@ -1194,28 +1194,13 @@ async fn concurrent_expired_range_reads_serve_cached_bytes_with_no_body_transfer
     );
 }
 
-/// R2.3: a `304` authorises exactly ONE Validated_Serve. If the refreshed TTL is not
-/// durable, the next request revalidates again rather than serving on the strength of
-/// a refresh that did not land.
-///
-/// # Why this is testable without forcing a write to fail
-///
-/// `refresh_object_ttl` records a TTL-refresh **journal entry** rather than writing
-/// the `.meta`, so the persisted `expires_at` does not move until the background
-/// consolidator applies it. Inside that window the refresh is exactly as
-/// non-durable as a failed write, and it occurs naturally on every `304` — no
-/// fault injection, no read-only filesystem, no platform-specific permission
-/// trickery.
-///
-/// This is the case R2.3's "SHALL revalidate again on the next request rather than
-/// treating the failed refresh as durable" is written for, and it uses a NON-ZERO
-/// TTL deliberately: with `get_ttl: 0` every read revalidates regardless, so a
-/// zero-TTL version of this test would pass whatever the refresh did and prove
-/// nothing about durability.
+/// R2.3: the authoritative headers and refreshed TTL from a `304` are persisted in
+/// one transaction. A second request inside a non-zero TTL can therefore use the
+/// durable refresh without another S3 request.
 ///
 /// Requirements: 2.3, 7.9.
 #[tokio::test]
-async fn nonzero_ttl_second_read_revalidates_again_while_refresh_is_undurable() {
+async fn nonzero_ttl_second_read_uses_durable_revalidation_refresh() {
     let config = test_config(OBJECT_SIZE);
     let fixture = Fixture::new(config).await;
     let cache_key = "bucket/expired-range-undurable-refresh.bin";
@@ -1256,32 +1241,26 @@ async fn nonzero_ttl_second_read_revalidates_again_while_refresh_is_undurable() 
         assert_eq!(
             body_of(response).await,
             old_bytes(len),
-            "R2.2: pass {} must serve the cached bytes after 304",
+            "R2.2: pass {} must serve the validated cached bytes",
             pass
         );
     }
 
-    // Two passes, two conditionals. One would mean the second read served on the
-    // strength of a refresh that is not yet on disk.
+    // The first pass validates and persists the new TTL. The second pass reads that
+    // durable freshness from disk and does not contact S3.
     let conditionals = conditional_requests(&stub.captured()).len();
-    assert!(
-        conditionals >= 2,
-        "R2.3: a 304 authorises ONE Validated_Serve; with the refreshed TTL not yet \
-         persisted the next request must revalidate again. Observed {} conditional \
-         request(s) across 2 passes",
-        conditionals
+    assert_eq!(
+        conditionals, 1,
+        "R2.3: the durable 304 transaction should cover the second read. Observed {} \
+         conditional request(s) across 2 passes",
+        conditionals,
     );
 
-    // The `.meta` still carries the pre-refresh expiry, which is what makes the
-    // second revalidation correct rather than wasteful. Asserted so a future change
-    // that makes the refresh synchronous fails HERE, naming the reason, instead of
-    // making the count assertion above mysteriously flaky.
+    // Prove the second serve rests on persisted state rather than only RAM state.
     let metadata = fixture.read_meta(cache_key).expect(".meta must exist");
     assert!(
-        std::time::SystemTime::now() > metadata.expires_at,
-        "the persisted expires_at is expected to be UNCHANGED inside the \
-         consolidation window — if the TTL refresh has become synchronous, this test's \
-         premise no longer holds and it needs rewriting against a real write failure"
+        std::time::SystemTime::now() <= metadata.expires_at,
+        "the 304 revalidation must persist the refreshed object TTL"
     );
 }
 

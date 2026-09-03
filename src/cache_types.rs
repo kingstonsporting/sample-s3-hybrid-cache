@@ -523,6 +523,27 @@ impl Default for ObjectMetadata {
 }
 
 impl ObjectMetadata {
+    /// Return the object's Last-Modified value from its typed field or stored headers.
+    pub fn effective_last_modified(&self) -> Option<&str> {
+        if !self.last_modified.is_empty() {
+            return Some(&self.last_modified);
+        }
+
+        self.response_headers
+            .iter()
+            .find(|(name, value)| name.eq_ignore_ascii_case("last-modified") && !value.is_empty())
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Keep the typed Last-Modified value and replayable response header in sync.
+    pub fn set_last_modified(&mut self, last_modified: String) {
+        self.last_modified.clone_from(&last_modified);
+        self.response_headers
+            .retain(|name, _| !name.eq_ignore_ascii_case("last-modified"));
+        self.response_headers
+            .insert("last-modified".to_string(), last_modified);
+    }
+
     /// Create a new ObjectMetadata with default values for new fields
     pub fn new(
         etag: String,
@@ -958,6 +979,14 @@ impl NewCacheMetadata {
     /// Refresh the object-level TTL by setting `expires_at = now + ttl`.
     pub fn refresh_object_ttl(&mut self, ttl: Duration) {
         self.expires_at = safe_expiry(SystemTime::now(), ttl);
+    }
+
+    /// Refresh both persisted expiry and the live-TTL anchor after S3 has
+    /// validated this representation.
+    pub fn refresh_object_after_revalidation(&mut self, ttl: Duration) {
+        let now = SystemTime::now();
+        self.created_at = now;
+        self.expires_at = safe_expiry(now, ttl);
     }
 }
 

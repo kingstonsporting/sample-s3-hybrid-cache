@@ -19,6 +19,18 @@ pub enum ProxyError {
     #[error("Cache error: {0}")]
     CacheError(String),
 
+    #[error(
+        "Cached object changed during revalidation: key={cache_key}, cached_etag={cached_etag}, response_etag={response_etag}"
+    )]
+    CacheVersionChanged {
+        cache_key: String,
+        cached_etag: String,
+        response_etag: String,
+    },
+
+    #[error("Invalid S3 revalidation response: {0}")]
+    InvalidRevalidation(String),
+
     #[error("Compression error: {0}")]
     CompressionError(String),
 

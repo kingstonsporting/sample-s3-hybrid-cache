@@ -6615,22 +6615,35 @@ impl DiskCacheManager {
                 }
             };
 
+        let last_modified = metadata.object_metadata.effective_last_modified();
+
         // Evaluate freshness against the current get_ttl (read-only comparison).
-        // get_ttl=0 means "always revalidate"; otherwise fresh when age ≤ ttl.
-        // Clock skew (created_at in the future) yields age 0 → fresh for non-zero ttl.
+        // get_ttl=0 means "always revalidate"; otherwise fresh when age <= ttl.
+        // A write-through entry without Last-Modified is incomplete and must
+        // revalidate before it can produce an S3-compatible cached response.
+        // Read-cache entries created by older versions may legitimately lack
+        // this header, so retain their existing TTL behavior.
+        // Clock skew (created_at in the future) yields age 0 and is fresh for any
+        // non-zero TTL once metadata is complete.
         let now = std::time::SystemTime::now();
         let age = now
             .duration_since(metadata.created_at)
             .unwrap_or(std::time::Duration::ZERO);
-        let expired = current_get_ttl.is_zero() || age > current_get_ttl;
+        let missing_write_cache_metadata =
+            metadata.object_metadata.is_write_cached && last_modified.is_none();
+        let expired =
+            missing_write_cache_metadata || current_get_ttl.is_zero() || age > current_get_ttl;
 
         if expired {
             debug!(
-                "Object expired per current get_ttl: key={}, age={:?}, current_get_ttl={:?}",
-                cache_key, age, current_get_ttl
+                "Object requires revalidation: key={}, age={:?}, current_get_ttl={:?}, missing_last_modified={}",
+                cache_key,
+                age,
+                current_get_ttl,
+                missing_write_cache_metadata
             );
             Ok(ObjectExpirationResult::Expired {
-                last_modified: Some(metadata.object_metadata.last_modified.clone()),
+                last_modified: last_modified.map(str::to_owned),
                 etag: Some(metadata.object_metadata.etag.clone()).filter(|e| !e.is_empty()),
             })
         } else {

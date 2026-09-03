@@ -38,7 +38,7 @@ lz4_flex = "0.11.6"
 # (see compression-content-aware-fix spec) to hand-roll a valid LZ4 frame with
 # uncompressed blocks — avoiding the LZ4 compressor entirely while still
 # producing a checksummed frame that lz4_flex::frame::FrameDecoder can read.
-twox-hash = "2.1.2"
+twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash32"] }
 
 # Hashing
 blake3 = "1.5"
@@ -114,6 +114,12 @@ opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
 # so constructing the exporter from inside the Tokio runtime (initialize()) is fine.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["metrics", "http-proto", "reqwest-blocking-client"] }
 opentelemetry-semantic-conventions = "0.32"
+
+# 2.1.2 uses checked addition for the xxHash32 input length and can panic for
+# valid inputs in debug/test builds. Pin the upstream one-line wrapping fix
+# until crates.io publishes it in a release.
+[patch.crates-io]
+twox-hash = { git = "https://github.com/shepmaster/twox-hash", rev = "7abcfc10c5e5b2f5ad4de820ebc83cda9fb01a1f" }
 
 # Platform-specific dependencies
 [target.'cfg(windows)'.dependencies]

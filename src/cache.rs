@@ -5,7 +5,7 @@
 //! and write-through caching for PUT operations.
 
 use crate::cache_types::safe_expiry;
-use crate::cache_types::CacheMetadata;
+use crate::cache_types::{CacheMetadata, NewCacheMetadata};
 use crate::compression::{CompressionAlgorithm, CompressionHandler};
 use crate::ram_cache::ShardedRamCache;
 use crate::{ProxyError, Result};
@@ -35,6 +35,64 @@ fn is_head_fresh(
     head_expires_at.is_some()
         && !current_head_ttl.is_zero()
         && now.duration_since(anchor).unwrap_or(Duration::ZERO) <= current_head_ttl
+}
+
+struct RevalidationChanges {
+    etag: bool,
+    last_modified: bool,
+    object_freshness: bool,
+    head_freshness: bool,
+    write_cache_graduation: bool,
+}
+
+impl RevalidationChanges {
+    fn detect(
+        metadata: &NewCacheMetadata,
+        response_metadata: &CacheMetadata,
+        get_ttl: Duration,
+        head_ttl: Duration,
+    ) -> Self {
+        let etag = !response_metadata.etag.is_empty()
+            && metadata.object_metadata.etag != response_metadata.etag;
+        let last_modified = metadata.object_metadata.effective_last_modified()
+            != Some(response_metadata.last_modified.as_str())
+            || !metadata
+                .object_metadata
+                .response_headers
+                .iter()
+                .any(|(name, value)| {
+                    name.eq_ignore_ascii_case("last-modified")
+                        && value == &response_metadata.last_modified
+                });
+
+        let now = SystemTime::now();
+        let object_expired = now
+            .duration_since(metadata.created_at)
+            .unwrap_or(Duration::ZERO)
+            > get_ttl;
+        let object_freshness = !get_ttl.is_zero() && (object_expired || etag || last_modified);
+        let head_freshness = !head_ttl.is_zero()
+            && metadata
+                .head_expires_at
+                .is_none_or(|expires_at| now > expires_at);
+        let write_cache_graduation = metadata.object_metadata.is_write_cached;
+
+        Self {
+            etag,
+            last_modified,
+            object_freshness,
+            head_freshness,
+            write_cache_graduation,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.etag
+            || self.last_modified
+            || self.object_freshness
+            || self.head_freshness
+            || self.write_cache_graduation
+    }
 }
 
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
@@ -6254,6 +6312,111 @@ impl CacheManager {
         debug!("Invalidated metadata cache for key: {}", cache_key);
     }
 
+    /// Apply the metadata, freshness, and write-tier graduation learned from an
+    /// S3 304 response in one locked transaction, then invalidate the older RAM
+    /// metadata snapshot.
+    ///
+    /// The ETag comparison happens against the latest on-disk record while the
+    /// metadata lock is held. If another write replaced the object after the
+    /// conditional request started, the caller must fetch from S3 instead of
+    /// serving bytes that the 304 did not validate.
+    pub async fn apply_not_modified_revalidation(
+        &self,
+        cache_key: &str,
+        response_metadata: &CacheMetadata,
+        get_ttl: Duration,
+        head_ttl: Duration,
+    ) -> Result<NewCacheMetadata> {
+        let writer = self.journal_components().hybrid_writer;
+        let writer = writer.lock().await;
+        let current_metadata = writer.read_existing_metadata(cache_key).await?;
+        let current_changes =
+            RevalidationChanges::detect(&current_metadata, response_metadata, get_ttl, head_ttl);
+        if !current_changes.any() {
+            return Ok(current_metadata);
+        }
+
+        if !self.acquire_write_lock(cache_key).await? {
+            return Err(ProxyError::LockContention(format!(
+                "Timed out acquiring cache write lock for 304 revalidation: key={}",
+                cache_key
+            )));
+        }
+
+        let response_metadata = response_metadata.clone();
+        let mut graduated_staged_size = None;
+        let result = writer
+            .update_existing_metadata(cache_key, |metadata| {
+                let changes =
+                    RevalidationChanges::detect(metadata, &response_metadata, get_ttl, head_ttl);
+                let cached_etag = &metadata.object_metadata.etag;
+                if !response_metadata.etag.is_empty()
+                    && !cached_etag.is_empty()
+                    && cached_etag != &response_metadata.etag
+                {
+                    return Err(ProxyError::CacheVersionChanged {
+                        cache_key: cache_key.to_string(),
+                        cached_etag: cached_etag.clone(),
+                        response_etag: response_metadata.etag.clone(),
+                    });
+                }
+
+                if changes.etag {
+                    metadata.object_metadata.etag = response_metadata.etag.clone();
+                }
+                if changes.last_modified && !response_metadata.last_modified.is_empty() {
+                    metadata
+                        .object_metadata
+                        .set_last_modified(response_metadata.last_modified.clone());
+                }
+                if metadata.object_metadata.effective_last_modified().is_none() {
+                    return Err(ProxyError::InvalidRevalidation(format!(
+                        "S3 304 response omitted Last-Modified for cache key {}",
+                        cache_key
+                    )));
+                }
+
+                if changes.object_freshness {
+                    metadata.refresh_object_after_revalidation(get_ttl);
+                }
+                if changes.head_freshness {
+                    metadata.refresh_head_ttl(head_ttl);
+                }
+                if changes.write_cache_graduation {
+                    graduated_staged_size = Some(metadata.staged_compressed_size());
+                    metadata.object_metadata.is_write_cached = false;
+                    metadata.object_metadata.write_cache_expires_at = None;
+                    metadata.object_metadata.write_cache_created_at = None;
+                    metadata.object_metadata.write_cache_last_accessed = None;
+                    for range in &mut metadata.ranges {
+                        range.staged = Some(false);
+                    }
+                    if !changes.object_freshness {
+                        metadata.expires_at = safe_expiry(SystemTime::now(), get_ttl);
+                    }
+                }
+                Ok(changes.any())
+            })
+            .await;
+        drop(writer);
+
+        let release_result = self.release_write_lock(cache_key).await;
+        match (result, release_result) {
+            (Ok((metadata, changed)), Ok(())) => {
+                if changed {
+                    self.metadata_cache.invalidate(cache_key).await;
+                }
+                if let Some(staged_size) = graduated_staged_size {
+                    self.record_write_cache_graduation(cache_key, staged_size)
+                        .await?;
+                }
+                Ok(metadata)
+            }
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     /// Sanitize cache key for new range storage architecture
     /// Uses percent encoding to prevent collisions while maintaining filesystem safety
     /// For keys that would exceed 200 characters, uses SHA-256 hash to ensure filesystem compatibility
@@ -9279,7 +9442,7 @@ impl CacheManager {
     ///
     /// # Requirements (write-through-cache-finalization)
     /// - Requirement 1.1: Store object data as single range (0 to content-length-1)
-    /// - Requirement 1.2: Create metadata with ETag and Content-Type from S3 response (Last-Modified learned on first cache-miss GET or first HEAD after PUT)
+    /// - Requirement 1.2: Create metadata with ETag and Content-Type from S3 response (Last-Modified learned by conditional validation on the first GET, or by the first HEAD after PUT)
     /// - Requirement 1.3: Set write cache TTL (default: 1 day)
     pub async fn store_put_as_write_cached_range(
         &self,
@@ -10508,6 +10671,7 @@ impl CacheManager {
             ProxyError::CacheError(format!("Failed to rename metadata file: {}", e))
         })?;
 
+        self.metadata_cache.invalidate(&metadata.cache_key).await;
         debug!("Stored metadata for key: {}", metadata.cache_key);
         Ok(())
     }
@@ -10585,8 +10749,8 @@ impl CacheManager {
     /// accounting attached, a silent failure is a silent leak, so:
     ///
     /// - `Ok(true)` — graduated, and the accounting entry was written.
-    /// - `Ok(false)` — nothing to do: no `.meta`, or the object is not write-cached
-    ///   (the overwhelmingly common case, since this is called on every cached GET).
+    /// - `Ok(false)` - nothing to do: no `.meta`, the object is not write-cached,
+    ///   or a write-through entry still needs its first Last-Modified validation.
     /// - `Err(_)` — the `.meta` could not be read, parsed, or written back, or the
     ///   graduation could not be journaled. The caller logs it; see the two call sites
     ///   in `http_proxy.rs`.
@@ -10661,6 +10825,20 @@ impl CacheManager {
             return Ok(false);
         }
 
+        // PUT and CompleteMultipartUpload responses do not include
+        // Last-Modified. Keep such entries in the write tier until the first
+        // conditional GET has learned and persisted that value. Otherwise the
+        // graduation below erases the only durable indication that this blank
+        // header is incomplete, and a failed validation could make the next GET
+        // serve the entry without Last-Modified again.
+        if metadata.object_metadata.effective_last_modified().is_none() {
+            debug!(
+                "Write-cached object still needs Last-Modified validation, deferring graduation: {}",
+                cache_key
+            );
+            return Ok(false);
+        }
+
         // The bytes leaving the write tier, summed per range through the single shared
         // staged-range predicate — the same figure the add sites credited, so the debit
         // is symmetric. Must be read BEFORE the flag is cleared below, since the
@@ -10728,9 +10906,43 @@ impl CacheManager {
             )));
         }
 
+        self.record_write_cache_graduation(cache_key, staged_compressed_size)
+            .await?;
+
+        // Format expires_in in human-readable format
+        let expires_in = metadata
+            .expires_at
+            .duration_since(SystemTime::now())
+            .map(|d| {
+                let secs = d.as_secs();
+                if secs >= 86400 {
+                    format!("{}d", secs / 86400)
+                } else if secs >= 3600 {
+                    format!("{}h", secs / 3600)
+                } else if secs >= 60 {
+                    format!("{}m", secs / 60)
+                } else {
+                    format!("{}s", secs)
+                }
+            })
+            .unwrap_or_else(|_| "expired".to_string());
+
+        debug!(
+            "Write-cache to read-cache transition: key={}, expires_in={}",
+            cache_key, expires_in
+        );
+        Ok(true)
+    }
+
+    /// Record the accounting side of a metadata transition out of the write tier.
+    async fn record_write_cache_graduation(
+        &self,
+        cache_key: &str,
+        staged_compressed_size: u64,
+    ) -> Result<()> {
         // R1.1/1.2/1.3: record the decrement for the consolidator to apply under the
         // global lock. Written AFTER the `.meta` transition, so a crash between the two
-        // leaves an entry that has graduated but not yet been debited — recoverable by
+        // leaves an entry that has graduated but not yet been debited - recoverable by
         // the next full Validation_Scan. The reverse order would debit an entry that is
         // still flagged staged, which the scan would then re-credit, oscillating.
         match self.journal_consolidator.read().await.as_ref() {
@@ -10761,30 +10973,7 @@ impl CacheManager {
         // Spec: write-cache-accounting-and-eviction. Requirements: 8.2, 8.3
         self.decrement_write_cache_staged_entries().await;
         self.increment_write_cache_graduations().await;
-
-        // Format expires_in in human-readable format
-        let expires_in = metadata
-            .expires_at
-            .duration_since(SystemTime::now())
-            .map(|d| {
-                let secs = d.as_secs();
-                if secs >= 86400 {
-                    format!("{}d", secs / 86400)
-                } else if secs >= 3600 {
-                    format!("{}h", secs / 3600)
-                } else if secs >= 60 {
-                    format!("{}m", secs / 60)
-                } else {
-                    format!("{}s", secs)
-                }
-            })
-            .unwrap_or_else(|_| "expired".to_string());
-
-        debug!(
-            "Write-cache to read-cache transition: key={}, expires_in={}",
-            cache_key, expires_in
-        );
-        Ok(true)
+        Ok(())
     }
 
     /// Check if an object is write-cached

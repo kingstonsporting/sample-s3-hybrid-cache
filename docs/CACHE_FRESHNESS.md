@@ -35,12 +35,14 @@ cache:
 
 **Cache Revalidation:**
 When an expired entry is accessed in lazy mode, the proxy uses HTTP conditional requests to validate freshness:
-1. Sends `If-None-Match` with the cached ETag and `If-Modified-Since` with the cached `Last-Modified` timestamp
+1. Sends `If-None-Match` with the cached ETag and, when known, `If-Modified-Since` with the cached `Last-Modified` timestamp
 2. If S3 returns `304 Not Modified`: Object unchanged, TTL refreshed, cached data served (no data transfer)
 3. If S3 returns `200 OK` (or `206 Partial Content` for a range request): Object changed, **all** old cached coverage for that key is invalidated, fresh data fetched and cached
 4. If S3 returns `403 Forbidden` or `401 Unauthorized`: Error returned to client, cached data preserved (a credentials failure is not a data change — cached data remains valid for other authorized callers). The proxy does **not** serve the expired data in this case.
 
 This applies to full-object GETs and to byte-range GETs alike. A range revalidation carries the client's original `Range` header **unchanged** — including suffix (`bytes=-512`) and open-ended (`bytes=1024-`) forms — so a client that signs `Range` as part of its SigV4 `SignedHeaders` is unaffected.
+
+A write-through PUT or completed multipart upload initially has an ETag but no Last-Modified because S3 does not return that header on the write response. Such an entry is treated as metadata-incomplete even inside its GET TTL. Its first full or ranged GET validates with `If-None-Match`; on S3's `304 Not Modified`, the proxy atomically persists S3's Last-Modified before serving the cached body, so the same client response includes the header.
 
 If the client sent its own `If-None-Match` or `If-Modified-Since`, the proxy does not inject its own validators on top; the client's precondition is forwarded and evaluated as the client intended.
 

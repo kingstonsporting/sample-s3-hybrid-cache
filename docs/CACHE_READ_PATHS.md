@@ -394,7 +394,7 @@ Concurrent part requests for the same object are handled by the InFlightTracker 
 
 ### Write-Through Cache
 
-Caches objects during PUT operations using the range storage format, enabling subsequent GET requests to be served from cache immediately without fetching from S3.
+Caches objects during PUT operations using the range storage format, enabling subsequent GET requests to use the cached body immediately. The first GET performs a conditional S3 request to complete metadata, but does not download the body when the object is unchanged.
 
 **Use Case**: Upload once, download many times immediately after
 
@@ -412,7 +412,7 @@ Caches objects during PUT operations using the range storage format, enabling su
 
 **Header Behavior for Write-Cached Objects**:
 - **ETag**: Available immediately from S3 PUT response
-- **Last-Modified**: S3 PUT responses don't include Last-Modified headers. The timestamp is populated only after a subsequent HEAD request or cache-miss GET operation. Cache hits for PUT-cached objects won't include Last-Modified headers until this timestamp is learned.
+- **Last-Modified**: S3 PUT responses don't include Last-Modified headers. The first GET treats the write-cache metadata as incomplete, validates the cached ETag with S3, persists Last-Modified from the `304 Not Modified` response, and includes it on that same client response. A HEAD request can also populate it.
 - **Content-Type**: If provided in the PUT request (single-part) or CreateMultipartUpload request (multipart), it is cached and used. If not provided, learned on first HEAD or cache-miss GET. Note: S3's CompleteMultipartUpload response has `content-type: application/xml` which is the XML response type, not the object's content-type - this is filtered out.
 
 #### TTL Transition on First Read
@@ -423,7 +423,8 @@ they are read. This is a one-time transition, not a refresh on every access:
 - Initial PUT: TTL set to `put_ttl` (default 1 hour)
 - First GET access: the entry transitions from `put_ttl` to `get_ttl`. This is a
   one-time transition, not a repeating refresh, and it runs before the freshness check
-  so `get_ttl: 0` revalidates against S3 on that first GET
+  so `get_ttl: 0` revalidates against S3 on that first GET. Missing Last-Modified
+  also forces this one-time revalidation even when `get_ttl` has not elapsed
 - No access within TTL: Object expires and is removed
 
 This keeps frequently accessed objects in cache while allowing rarely-read uploads to expire.
@@ -517,7 +518,7 @@ Caches multipart uploads with intelligent capacity management and shared cache c
 - Calculate final byte offsets for each part
 - Rename part files with final offsets
 - Create object metadata with `is_write_cached=true`, ETag, and Content-Type (if provided in CreateMultipartUpload)
-- Note: Last-Modified is NOT available from CompleteMultipartUpload response; learned on first HEAD or cache-miss GET
+- Note: Last-Modified is not available from CompleteMultipartUpload. The first GET conditionally validates the final ETag, persists Last-Modified from S3's 304 response, and returns it to the client; a HEAD request can also populate it.
 - Delete tracking directory
 - Return S3 response unchanged
 

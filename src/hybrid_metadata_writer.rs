@@ -157,6 +157,49 @@ impl HybridMetadataWriter {
         .await
     }
 
+    /// Atomically mutate an existing metadata record while holding its per-key lock.
+    ///
+    /// This is the shared read-modify-write primitive for metadata changes that do
+    /// not fit the range journal model. The callback runs after the latest on-disk
+    /// record has been loaded, preventing a revalidation or similar update from
+    /// overwriting ranges written by another process.
+    pub async fn update_existing_metadata<F>(
+        &self,
+        cache_key: &str,
+        update: F,
+    ) -> Result<(NewCacheMetadata, bool)>
+    where
+        F: FnOnce(&mut NewCacheMetadata) -> Result<bool>,
+    {
+        let lock = self.lock_manager.acquire_lock(cache_key).await?;
+        let mut metadata = self.read_existing_metadata(cache_key).await?;
+
+        let changed = update(&mut metadata)?;
+        if changed {
+            self.write_metadata_to_disk(&metadata, &lock).await?;
+        }
+        Ok((metadata, changed))
+    }
+
+    /// Read an existing metadata record written through the atomic rename path.
+    pub async fn read_existing_metadata(&self, cache_key: &str) -> Result<NewCacheMetadata> {
+        let metadata_path = self.get_metadata_file_path(cache_key)?;
+        let content = tokio::fs::read_to_string(&metadata_path)
+            .await
+            .map_err(|e| {
+                ProxyError::CacheError(format!(
+                    "Failed to read metadata file for update: key={}, path={:?}, error={}",
+                    cache_key, metadata_path, e
+                ))
+            })?;
+        serde_json::from_str(&content).map_err(|e| {
+            ProxyError::CacheError(format!(
+                "Failed to parse metadata file for update: key={}, path={:?}, error={}",
+                cache_key, metadata_path, e
+            ))
+        })
+    }
+
     /// Write empty object metadata (no ranges)
     async fn write_empty_object_metadata(
         &mut self,

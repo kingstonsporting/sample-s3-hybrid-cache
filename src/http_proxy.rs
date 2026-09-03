@@ -6,7 +6,7 @@
 
 use crate::{
     cache::CacheManager,
-    cache_types::{CacheMetadata, ObjectExpirationResult},
+    cache_types::{CacheMetadata, NewCacheMetadata, ObjectExpirationResult},
     config::Config,
     destination_policy::DestinationPolicy,
     disk_cache::{DiskCacheManager, IncrementalRangeWriter},
@@ -61,6 +61,12 @@ pub enum CacheBypassMode {
     NoCache,
     /// Bypass cache lookup and do not cache the response (Cache-Control: no-store)
     NoStore,
+}
+
+/// Headers and optional durable metadata learned from an S3 304 response.
+struct AppliedRevalidation {
+    persisted_metadata: Option<NewCacheMetadata>,
+    response_metadata: CacheMetadata,
 }
 
 /// Parse Cache-Control header value to determine bypass mode
@@ -3664,72 +3670,79 @@ impl HttpProxy {
                                         match s3_client.forward_request(validation_context).await {
                                             Ok(response) => {
                                                 if response.status == StatusCode::NOT_MODIFIED {
-                                                    // 304 Not Modified - refresh TTL and serve from cache (Requirement 2.3)
+                                                    // 304 Not Modified - atomically refresh metadata and serve from cache (Requirement 2.3)
                                                     debug!(
-                                                    "Full object conditional validation returned 304 Not Modified, refreshing TTL: cache_key={}",
+                                                    "Full object conditional validation returned 304 Not Modified: cache_key={}",
                                                     cache_key
                                                 );
 
-                                                    let mut disk_cache_guard =
-                                                        disk_cache.write().await;
-                                                    if let Err(e) = disk_cache_guard
-                                                        .refresh_object_ttl(
+                                                    if let Some(revalidation) =
+                                                        Self::apply_not_modified_revalidation(
                                                             &cache_key,
+                                                            &response.headers,
+                                                            &cache_manager,
+                                                            &s3_client,
                                                             resolved_settings.get_ttl,
+                                                            resolved_settings.head_ttl,
                                                         )
                                                         .await
                                                     {
-                                                        debug!(
-                                                            "Failed to refresh full object TTL: {}",
-                                                            e
-                                                        );
-                                                    }
-                                                    drop(disk_cache_guard);
-
-                                                    // Notify any waiters on the flight key.
-                                                    if let Some(g) = fetcher_guard.take() {
-                                                        g.complete_success();
-                                                        if let Some(ref mm) = metrics_manager {
-                                                            mm.read()
-                                                                .await
-                                                                .record_coalesce_fetcher_success()
-                                                                .await;
+                                                        // Notify any waiters on the flight key.
+                                                        if let Some(g) = fetcher_guard.take() {
+                                                            g.complete_success();
+                                                            if let Some(ref mm) = metrics_manager {
+                                                                mm.read()
+                                                                    .await
+                                                                    .record_coalesce_fetcher_success()
+                                                                    .await;
+                                                            }
                                                         }
+
+                                                        // Serve from cache. The 304 is
+                                                        // the authority - S3 has
+                                                        // confirmed this representation
+                                                        // is current - so stored expiry
+                                                        // must not veto it. Coverage was
+                                                        // established by the lookup that
+                                                        // opened this arm; a missing
+                                                        // `.bin` still fails at load time
+                                                        // and falls back rather than
+                                                        // serving. R2.2, R2.3.
+                                                        let header_map: HeaderMap = header_map
+                                                            .iter()
+                                                            .filter_map(|(k, v)| {
+                                                                HeaderName::from_str(k).ok().zip(
+                                                                    HeaderValue::from_str(v).ok(),
+                                                                )
+                                                            })
+                                                            .collect();
+                                                        let mut cached_response =
+                                                            Self::serve_full_object_from_cache(
+                                                                method,
+                                                                &full_range,
+                                                                &overlap,
+                                                                &cache_key,
+                                                                cache_manager,
+                                                                range_handler,
+                                                                s3_client,
+                                                                &host,
+                                                                uri.path(),
+                                                                &header_map,
+                                                                config,
+                                                                &resolved_settings,
+                                                            )
+                                                            .await?;
+                                                        Self::overlay_revalidation_headers(
+                                                            &mut cached_response,
+                                                            &revalidation.response_metadata,
+                                                        );
+                                                        return Ok(cached_response);
                                                     }
 
-                                                    // Serve from cache. The 304 is
-                                                    // the authority — S3 has
-                                                    // confirmed this representation
-                                                    // is current — so stored expiry
-                                                    // must not veto it. Coverage was
-                                                    // established by the lookup that
-                                                    // opened this arm; a missing
-                                                    // `.bin` still fails at load time
-                                                    // and falls back rather than
-                                                    // serving. R2.2, R2.3.
-                                                    let header_map: HeaderMap = header_map
-                                                        .iter()
-                                                        .filter_map(|(k, v)| {
-                                                            HeaderName::from_str(k)
-                                                                .ok()
-                                                                .zip(HeaderValue::from_str(v).ok())
-                                                        })
-                                                        .collect();
-                                                    return Self::serve_full_object_from_cache(
-                                                        method,
-                                                        &full_range,
-                                                        &overlap,
-                                                        &cache_key,
-                                                        cache_manager,
-                                                        range_handler,
-                                                        s3_client,
-                                                        &host,
-                                                        uri.path(),
-                                                        &header_map,
-                                                        config,
-                                                        &resolved_settings,
-                                                    )
-                                                    .await;
+                                                    debug!(
+                                                        "S3 304 did not validate the latest cached version; forwarding original request: cache_key={}",
+                                                        cache_key
+                                                    );
                                                 } else if response.status == StatusCode::OK {
                                                     // 200 OK - data changed, remove stale range and forward to S3 (Requirement 2.4)
                                                     debug!(
@@ -5319,7 +5332,6 @@ impl HttpProxy {
     /// headers (`If-Range` / `If-Match` / `If-None-Match`) are widened on the
     /// same terms — the response handler branches on status rather than
     /// assuming a sliceable Page (Requirement 2.6).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     async fn try_widened_range_request(
         cache_key: &str,
@@ -7205,98 +7217,130 @@ impl HttpProxy {
                                     match s3_client.forward_request(validation_context).await {
                                         Ok(response) => {
                                             if response.status == StatusCode::NOT_MODIFIED {
-                                                // 304 Not Modified - refresh TTL and serve from cache (Requirement 1.5, 6.4)
+                                                // 304 Not Modified - atomically refresh metadata and serve from cache (Requirement 1.5, 6.4)
                                                 debug!(
-                                                "Conditional validation returned 304 Not Modified, refreshing TTL: cache_key={}",
+                                                "Conditional validation returned 304 Not Modified: cache_key={}",
                                                 cache_key
                                             );
 
-                                                let mut disk_cache_guard = disk_cache.write().await;
-                                                if let Err(e) = disk_cache_guard
-                                                    .refresh_object_ttl(
+                                                if let Some(revalidation) =
+                                                    Self::apply_not_modified_revalidation(
                                                         &cache_key,
+                                                        &response.headers,
+                                                        &cache_manager,
+                                                        &s3_client,
                                                         resolved.get_ttl,
+                                                        resolved.head_ttl,
                                                     )
                                                     .await
                                                 {
-                                                    warn!("Failed to refresh object TTL: {}", e);
-                                                }
-                                                drop(disk_cache_guard);
-
-                                                if let Some(g) = fetcher_guard.take() {
-                                                    g.complete_success();
-                                                    if let Some(ref mm) = metrics_manager {
-                                                        mm.read()
-                                                            .await
-                                                            .record_coalesce_fetcher_success()
-                                                            .await;
+                                                    let mut response_metadata =
+                                                        preloaded_metadata.clone();
+                                                    if let Some(metadata) =
+                                                        response_metadata.as_mut()
+                                                    {
+                                                        Self::apply_revalidation_to_object_metadata(
+                                                            &mut metadata.object_metadata,
+                                                            &revalidation,
+                                                        );
+                                                    } else {
+                                                        response_metadata =
+                                                            revalidation.persisted_metadata.clone();
                                                     }
+
+                                                    if let Some(g) = fetcher_guard.take() {
+                                                        g.complete_success();
+                                                        if let Some(ref mm) = metrics_manager {
+                                                            mm.read()
+                                                                .await
+                                                                .record_coalesce_fetcher_success()
+                                                                .await;
+                                                        }
+                                                    }
+
+                                                    // The 304 is the authority here, so
+                                                    // `has_complete_coverage` rather than
+                                                    // `is_serveable_unvalidated`: S3 has
+                                                    // confirmed the version, and vetoing
+                                                    // on stored expiry would discard a
+                                                    // valid Validated_Serve. It proves the
+                                                    // version, not the coverage, so
+                                                    // completeness is still required.
+                                                    // R3.4, R3.6, R2.3.
+                                                    if overlap.has_complete_coverage() {
+                                                        let header_map: HeaderMap = client_headers
+                                                            .iter()
+                                                            .filter_map(|(k, v)| {
+                                                                let name = k
+                                                                    .parse::<hyper::header::HeaderName>()
+                                                                    .ok();
+                                                                let val = v
+                                                                    .parse::<hyper::header::HeaderValue>()
+                                                                    .ok();
+                                                                name.zip(val)
+                                                            })
+                                                            .collect();
+                                                        let mut cached_response =
+                                                            Self::serve_range_from_cache(
+                                                                method,
+                                                                &range_spec,
+                                                                &overlap,
+                                                                &cache_key,
+                                                                cache_manager,
+                                                                range_handler,
+                                                                s3_client.clone(),
+                                                                &host,
+                                                                &uri.to_string(),
+                                                                &header_map,
+                                                                config.clone(),
+                                                                response_metadata.as_ref(),
+                                                                resolved,
+                                                                permit.clone(),
+                                                            )
+                                                            .await?;
+                                                        Self::overlay_revalidation_headers(
+                                                            &mut cached_response,
+                                                            &revalidation.response_metadata,
+                                                        );
+                                                        return Ok(cached_response);
+                                                    }
+
+                                                    // A 304 proves cached extents belong to the current
+                                                    // object, but not that they cover this request. Fetch
+                                                    // only the hole through the ordinary partial-range path.
+                                                    cache_manager
+                                                        .record_incomplete_range_fallback();
+                                                    let mut range_response =
+                                                        Self::forward_range_request_to_s3(
+                                                            method,
+                                                            uri.clone(),
+                                                            host.clone(),
+                                                            client_headers.clone(),
+                                                            cache_key.clone(),
+                                                            range_spec.clone(),
+                                                            overlap,
+                                                            cache_manager,
+                                                            range_handler.clone(),
+                                                            s3_client,
+                                                            config.clone(),
+                                                            response_metadata.as_ref(),
+                                                            resolved,
+                                                            proxy_referer,
+                                                            None,
+                                                            permit.clone(),
+                                                        )
+                                                        .await?;
+                                                    Self::overlay_revalidation_headers(
+                                                        &mut range_response,
+                                                        &revalidation.response_metadata,
+                                                    );
+                                                    return Ok(range_response);
                                                 }
 
-                                                // The 304 is the authority here, so
-                                                // `has_complete_coverage` rather than
-                                                // `is_serveable_unvalidated`: S3 has
-                                                // confirmed the version, and vetoing
-                                                // on stored expiry would discard a
-                                                // valid Validated_Serve. It proves the
-                                                // version, not the coverage, so
-                                                // completeness is still required —
-                                                // R3.4, R3.6, R2.3.
-                                                if overlap.has_complete_coverage() {
-                                                    let header_map: HeaderMap = client_headers
-                                                        .iter()
-                                                        .filter_map(|(k, v)| {
-                                                            let name = k
-                                                                .parse::<hyper::header::HeaderName>()
-                                                                .ok();
-                                                            let val = v
-                                                                .parse::<hyper::header::HeaderValue>()
-                                                                .ok();
-                                                            name.zip(val)
-                                                        })
-                                                        .collect();
-                                                    return Self::serve_range_from_cache(
-                                                        method,
-                                                        &range_spec,
-                                                        &overlap,
-                                                        &cache_key,
-                                                        cache_manager,
-                                                        range_handler,
-                                                        s3_client.clone(),
-                                                        &host,
-                                                        &uri.to_string(),
-                                                        &header_map,
-                                                        config.clone(),
-                                                        preloaded_metadata.as_ref(),
-                                                        resolved,
-                                                        permit.clone(),
-                                                    )
-                                                    .await;
-                                                }
-
-                                                // A 304 proves cached extents belong to the current
-                                                // object, but not that they cover this request. Fetch
-                                                // only the hole through the ordinary partial-range path.
-                                                cache_manager.record_incomplete_range_fallback();
-                                                return Self::forward_range_request_to_s3(
-                                                    method,
-                                                    uri.clone(),
-                                                    host.clone(),
-                                                    client_headers.clone(),
-                                                    cache_key.clone(),
-                                                    range_spec.clone(),
-                                                    overlap,
-                                                    cache_manager,
-                                                    range_handler.clone(),
-                                                    s3_client,
-                                                    config.clone(),
-                                                    preloaded_metadata.as_ref(),
-                                                    resolved,
-                                                    proxy_referer,
-                                                    None,
-                                                    permit.clone(),
-                                                )
-                                                .await;
+                                                debug!(
+                                                    "S3 304 did not validate the latest cached version; forwarding original request: cache_key={}",
+                                                    cache_key
+                                                );
                                             } else if response.status == StatusCode::OK
                                                 || response.status == StatusCode::PARTIAL_CONTENT
                                             {
@@ -8595,6 +8639,95 @@ impl HttpProxy {
             "Could not retrieve cached metadata for range response after retries, using minimal headers"
         );
         crate::cache_types::ObjectMetadata::default()
+    }
+
+    /// Apply an S3 304 response to cached metadata and refresh both cache TTLs.
+    ///
+    /// A metadata I/O failure is non-fatal because the authoritative response
+    /// headers can still be overlaid on this client response. A semantic failure,
+    /// such as an ETag changing while validation was in flight, returns `None` so
+    /// the caller fetches the original request from S3 instead of serving bytes the
+    /// 304 did not validate.
+    async fn apply_not_modified_revalidation(
+        cache_key: &str,
+        response_headers: &HashMap<String, String>,
+        cache_manager: &Arc<CacheManager>,
+        s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
+        get_ttl: Duration,
+        head_ttl: Duration,
+    ) -> Option<AppliedRevalidation> {
+        let response_metadata = s3_client.extract_metadata_from_response(response_headers);
+        if response_metadata.last_modified.is_empty() {
+            warn!(
+                "S3 304 omitted Last-Modified; forwarding original request: cache_key={}",
+                cache_key
+            );
+            return None;
+        }
+        match cache_manager
+            .apply_not_modified_revalidation(cache_key, &response_metadata, get_ttl, head_ttl)
+            .await
+        {
+            Ok(metadata) => Some(AppliedRevalidation {
+                persisted_metadata: Some(metadata),
+                response_metadata,
+            }),
+            Err(error @ ProxyError::CacheVersionChanged { .. })
+            | Err(error @ ProxyError::InvalidRevalidation(_)) => {
+                warn!(
+                    "S3 304 could not validate the current cached representation: cache_key={}, error={}",
+                    cache_key, error
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to finish S3 revalidation bookkeeping; serving this response with authoritative 304 headers: cache_key={}, error={}",
+                    cache_key, e
+                );
+                Some(AppliedRevalidation {
+                    persisted_metadata: None,
+                    response_metadata,
+                })
+            }
+        }
+    }
+
+    /// Overlay authoritative S3 revalidation headers on a cached response even
+    /// when the best-effort metadata persistence failed.
+    fn overlay_revalidation_headers(
+        response: &mut Response<BoxBody<Bytes, hyper::Error>>,
+        metadata: &CacheMetadata,
+    ) {
+        for (name, value) in [
+            ("etag", metadata.etag.as_str()),
+            ("last-modified", metadata.last_modified.as_str()),
+        ] {
+            if value.is_empty() {
+                continue;
+            }
+            if let Ok(value) = HeaderValue::from_str(value) {
+                response
+                    .headers_mut()
+                    .insert(HeaderName::from_static(name), value);
+            }
+        }
+    }
+
+    fn apply_revalidation_to_object_metadata(
+        object_metadata: &mut crate::cache_types::ObjectMetadata,
+        revalidation: &AppliedRevalidation,
+    ) {
+        if let Some(metadata) = &revalidation.persisted_metadata {
+            *object_metadata = metadata.object_metadata.clone();
+            return;
+        }
+        if !revalidation.response_metadata.etag.is_empty() {
+            object_metadata.etag = revalidation.response_metadata.etag.clone();
+        }
+        if !revalidation.response_metadata.last_modified.is_empty() {
+            object_metadata.set_last_modified(revalidation.response_metadata.last_modified.clone());
+        }
     }
 
     /// Add cached S3 headers to a response builder.
@@ -10549,7 +10682,7 @@ impl HttpProxy {
             .await
             .unwrap_or_default();
 
-        let metadata = match preloaded_metadata {
+        let mut metadata = match preloaded_metadata {
             Some(m) => m,
             None => {
                 debug!(
@@ -10613,14 +10746,32 @@ impl HttpProxy {
                     mm_guard.record_coalesce_cache_hit().await;
                 }
 
-                // Best-effort TTL refresh. `refresh_cache_ttl` updates both
-                // GET and HEAD expires_at using the effective TTLs.
-                if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
-                    debug!(
-                        "Coalescing waiter (validated): TTL refresh failed for {}: {}",
-                        cache_key, e
-                    );
-                }
+                let Some(revalidation) = Self::apply_not_modified_revalidation(
+                    &cache_key,
+                    &response.headers,
+                    &cache_manager,
+                    &s3_client,
+                    resolved.get_ttl,
+                    resolved.head_ttl,
+                )
+                .await
+                else {
+                    return Self::forward_get_head_to_s3_without_caching(
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        s3_client,
+                        None,
+                        proxy_referer,
+                        permit,
+                    )
+                    .await;
+                };
+                Self::apply_revalidation_to_object_metadata(
+                    &mut metadata.object_metadata,
+                    &revalidation,
+                );
 
                 cache_manager
                     .record_bucket_cache_access(
@@ -10640,13 +10791,18 @@ impl HttpProxy {
                             .header("x-cache", "HIT"),
                         &metadata.object_metadata,
                     );
-                    return Ok(builder
+                    let mut cached_response = builder
                         .body(
                             Full::new(Bytes::new())
                                 .map_err(|never| match never {})
                                 .boxed(),
                         )
-                        .unwrap());
+                        .unwrap();
+                    Self::overlay_revalidation_headers(
+                        &mut cached_response,
+                        &revalidation.response_metadata,
+                    );
+                    return Ok(cached_response);
                 }
 
                 // GET: serve the cached body via the existing helper.
@@ -10657,13 +10813,18 @@ impl HttpProxy {
                         Response::builder().status(StatusCode::OK),
                         &metadata.object_metadata,
                     );
-                    return Ok(builder
+                    let mut cached_response = builder
                         .body(
                             Full::new(Bytes::new())
                                 .map_err(|never| match never {})
                                 .boxed(),
                         )
-                        .unwrap());
+                        .unwrap();
+                    Self::overlay_revalidation_headers(
+                        &mut cached_response,
+                        &revalidation.response_metadata,
+                    );
+                    return Ok(cached_response);
                 }
 
                 let full_range = RangeSpec {
@@ -10696,7 +10857,7 @@ impl HttpProxy {
                                     .zip(v.parse::<HeaderValue>().ok())
                             })
                             .collect();
-                        Self::serve_full_object_from_cache(
+                        let mut cached_response = Self::serve_full_object_from_cache(
                             method,
                             &full_range,
                             &overlap,
@@ -10710,7 +10871,12 @@ impl HttpProxy {
                             config,
                             resolved,
                         )
-                        .await
+                        .await?;
+                        Self::overlay_revalidation_headers(
+                            &mut cached_response,
+                            &revalidation.response_metadata,
+                        );
+                        Ok(cached_response)
                     }
                     _ => {
                         // The cache was concurrently evicted between
@@ -11065,7 +11231,7 @@ impl HttpProxy {
             .await
             .unwrap_or_default();
 
-        let metadata = match preloaded_metadata {
+        let mut metadata = match preloaded_metadata {
             Some(m) => m,
             None => {
                 debug!(
@@ -11163,12 +11329,32 @@ impl HttpProxy {
                     mm_guard.record_coalesce_waiter_conditional_304().await;
                     mm_guard.record_coalesce_cache_hit().await;
                 }
-                if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
-                    debug!(
-                        "Coalescing range waiter (validated): TTL refresh failed for {}: {}",
-                        cache_key, e
-                    );
-                }
+                let Some(revalidation) = Self::apply_not_modified_revalidation(
+                    &cache_key,
+                    &response.headers,
+                    &cache_manager,
+                    &s3_client,
+                    resolved.get_ttl,
+                    resolved.head_ttl,
+                )
+                .await
+                else {
+                    return Self::forward_get_head_to_s3_without_caching(
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        s3_client,
+                        None,
+                        proxy_referer,
+                        permit,
+                    )
+                    .await;
+                };
+                Self::apply_revalidation_to_object_metadata(
+                    &mut metadata.object_metadata,
+                    &revalidation,
+                );
                 // Recompute overlap and serve range from cache.
                 //
                 // RevalidationCandidate under the explicit authority of the 304
@@ -11245,7 +11431,7 @@ impl HttpProxy {
                             .zip(v.parse::<HeaderValue>().ok())
                     })
                     .collect();
-                Self::serve_range_from_cache(
+                let mut cached_response = Self::serve_range_from_cache(
                     method,
                     &range_spec,
                     &overlap,
@@ -11261,7 +11447,12 @@ impl HttpProxy {
                     resolved,
                     permit.clone(),
                 )
-                .await
+                .await?;
+                Self::overlay_revalidation_headers(
+                    &mut cached_response,
+                    &revalidation.response_metadata,
+                );
+                Ok(cached_response)
             }
             Ok(response)
                 if response.status == StatusCode::OK
@@ -11454,7 +11645,7 @@ impl HttpProxy {
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Look up the cached part. If part metadata is missing, fall back
         // to signed S3 fetch with the waiter's own headers.
-        let cached_part = match cache_manager.lookup_part(&cache_key, part_number).await {
+        let mut cached_part = match cache_manager.lookup_part(&cache_key, part_number).await {
             Ok(Some(p)) => p,
             _ => {
                 debug!(
@@ -11536,16 +11727,56 @@ impl HttpProxy {
                     mm_guard.record_coalesce_waiter_conditional_304().await;
                     mm_guard.record_coalesce_cache_hit().await;
                 }
-                if let Err(e) = cache_manager.refresh_cache_ttl(&cache_key).await {
-                    debug!(
-                        "Coalescing part waiter (validated): TTL refresh failed for {}: {}",
-                        cache_key, e
+                let Some(revalidation) = Self::apply_not_modified_revalidation(
+                    &cache_key,
+                    &response.headers,
+                    &cache_manager,
+                    &s3_client,
+                    resolved.get_ttl,
+                    resolved.head_ttl,
+                )
+                .await
+                else {
+                    return Self::forward_get_head_to_s3_without_caching(
+                        method,
+                        uri,
+                        host,
+                        headers,
+                        s3_client,
+                        None,
+                        proxy_referer,
+                        permit,
+                    )
+                    .await;
+                };
+                if !revalidation.response_metadata.etag.is_empty() {
+                    cached_part
+                        .headers
+                        .retain(|name, _| !name.eq_ignore_ascii_case("etag"));
+                    cached_part.headers.insert(
+                        "etag".to_string(),
+                        revalidation.response_metadata.etag.clone(),
+                    );
+                }
+                if !revalidation.response_metadata.last_modified.is_empty() {
+                    cached_part
+                        .headers
+                        .retain(|name, _| !name.eq_ignore_ascii_case("last-modified"));
+                    cached_part.headers.insert(
+                        "last-modified".to_string(),
+                        revalidation.response_metadata.last_modified.clone(),
                     );
                 }
                 cache_manager
                     .record_bucket_cache_access(&cache_key, true, false, &resolved.source)
                     .await;
-                Self::serve_cached_part_response(cached_part, method, uri.path()).await
+                let mut cached_response =
+                    Self::serve_cached_part_response(cached_part, method, uri.path()).await?;
+                Self::overlay_revalidation_headers(
+                    &mut cached_response,
+                    &revalidation.response_metadata,
+                );
+                Ok(cached_response)
             }
             Ok(response)
                 if response.status == StatusCode::OK

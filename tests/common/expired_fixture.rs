@@ -112,9 +112,7 @@ impl SeedSpec {
     }
 
     /// Stored-fresh but live-expired: the state an operator produces by
-    /// tightening `get_ttl` on an already-cached key, and the state any prior
-    /// `304` leaves behind (`refresh_object_ttl` moves `expires_at` to
-    /// `now + ttl` and leaves `created_at` alone).
+    /// tightening `get_ttl` on an already-cached key.
     pub fn stored_fresh_live_expired(
         extents: Vec<(u64, u64)>,
         content_length: u64,
@@ -566,7 +564,9 @@ pub fn signed_range_authorization() -> String {
 
 /// Response a stub returns for a `304 Not Modified`, which carries no body.
 pub fn not_modified(etag: &str) -> super::StubResponse {
-    super::StubResponse::with_status(StatusCode::NOT_MODIFIED).with_header("etag", etag)
+    super::StubResponse::with_status(StatusCode::NOT_MODIFIED)
+        .with_header("etag", etag)
+        .with_header("last-modified", "Wed, 01 Jan 2025 00:00:00 GMT")
 }
 
 // =========================================================================
