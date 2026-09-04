@@ -833,12 +833,24 @@ impl MetadataLockManager {
         };
 
         if content.trim().is_empty() {
-            // Empty lock file is stale
+            // An empty lock file is usually a live holder that has opened+flocked the
+            // file but not yet written its content (`try_acquire_lock_once` creates
+            // the file before it writes). Treating that window as "stale" let a
+            // contender delete the file from under the holder and take a second lock
+            // on a fresh inode, so two writers held the "exclusive" metadata lock at
+            // once. Only an empty file older than the cross-host timeout is stale.
+            let file_age_ms = std::fs::metadata(lock_file_path)
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(u64::MAX);
+            let stale = file_age_ms > self.metadata_lock_timeout_ms;
             debug!(
-                "Lock file is empty, considering stale: path={:?}",
-                lock_file_path
+                "Lock file is empty (holder may still be writing it): path={:?}, age_ms={}, stale={}",
+                lock_file_path, file_age_ms, stale
             );
-            return Ok(true);
+            return Ok(stale);
         }
 
         // Parse lock content — unparseable files are treated as remote-owned
@@ -2004,9 +2016,12 @@ mod tests {
         );
     }
 
-    /// Requirement 3.5: Empty lock file is always stale
+    /// An empty lock file is a holder that has created and flocked the file but not
+    /// yet written its content, so it is live while young and stale only once it is
+    /// older than the cross-host timeout. Treating every empty file as stale let a
+    /// contender delete a live holder's lock and take a second "exclusive" lock.
     #[test]
-    fn test_empty_lock_file_is_stale() {
+    fn test_empty_lock_file_is_stale_only_when_older_than_the_timeout() {
         let temp_dir = TempDir::new().unwrap();
         let manager =
             MetadataLockManager::new(temp_dir.path().to_path_buf(), Duration::from_secs(30), 3);
@@ -2015,8 +2030,16 @@ mod tests {
         std::fs::write(&lock_path, "").unwrap();
 
         assert!(
+            !manager.is_lock_stale(&lock_path).unwrap(),
+            "a freshly created empty lock file belongs to a holder still writing it"
+        );
+
+        let old =
+            SystemTime::now() - Duration::from_millis(manager.metadata_lock_timeout_ms + 1_000);
+        filetime::set_file_mtime(&lock_path, filetime::FileTime::from_system_time(old)).unwrap();
+        assert!(
             manager.is_lock_stale(&lock_path).unwrap(),
-            "Empty lock file should always be stale"
+            "an empty lock file older than the timeout is stale"
         );
     }
 

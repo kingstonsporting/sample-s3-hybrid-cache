@@ -1074,6 +1074,36 @@ Cache Response for Future Requests
 - **Background Caching**: Cache writes happen asynchronously without blocking the client
 - **Error Resilience**: Cache failures don't affect client responses
 
+### Cache Repair Never Rewrites a Signed Header
+
+Every path that repairs the cache by fetching from S3 on the client's behalf is bound
+by the same rule as the miss path above, and enforces it itself rather than trusting
+its caller (the production incident of 2026-09-03 reached one of these paths through
+a route that had not checked):
+
+- `RangeHandler::fetch_missing_ranges` and the merge fallback
+  (`fallback_to_complete_s3_fetch`) return `ProxyError::SignedHeaderRewriteRefused`
+  instead of replacing a signed `Range`. The fallback forwards the client's own
+  `Range` value byte-for-byte when it names the requested extent (including suffix
+  and open-ended forms), so the signature stays valid.
+- `stream_range_from_s3_with_caching` and the partially-cached branch of
+  `forward_range_request_to_s3` forward a signed `Range` verbatim and never split it
+  into per-hole sub-fetches.
+- When a cached range cannot be served as recorded (its `.bin` is missing, truncated,
+  or fails decompression, or decodes to fewer bytes than the extent), the proxy
+  **evicts that range from disk and every RAM tier and forwards the client's original
+  request unchanged** (`fail_open_after_inconsistent_range`). It never fetches a
+  synthetic sub-range, never clamps a short body into a "valid" shorter range, and
+  never caches a response body without checking its status: `DiskCacheManager::store_range`
+  refuses a body shorter than its range unless S3's own `Content-Range` says the
+  object ends there, and refuses an ETag-less range over metadata that carries an ETag.
+
+Multipart completion publishes its `.meta` under the per-key metadata lock, with the
+ETag in S3's quoted wire form, and drops the RAM metadata snapshot when it does; every
+other `.meta` writer (consolidator, HEAD refresh, graduation, invalidation) invalidates
+that snapshot too, so a reader can never compare a stale in-memory ETag against the
+disk record and invalidate a freshly published object.
+
 ### When This Applies
 
 Signed range requests are detected when:

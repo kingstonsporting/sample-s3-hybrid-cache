@@ -312,6 +312,17 @@ fn normalize_etag(etag: &str) -> &str {
     etag.trim_matches('"')
 }
 
+/// The ETag in the form S3 puts on the wire: surrounded by double quotes.
+///
+/// Every cache writer that learns an ETag from a response header stores it quoted;
+/// the multipart completion body is the one source that reaches us stripped. The
+/// stored form must match what later HEAD/GET responses and `If-None-Match`
+/// comparisons use, or the entry is treated as a changed object on first read.
+fn s3_wire_etag(etag: &str) -> String {
+    let bare = etag.trim().trim_matches('"');
+    format!("\"{}\"", bare)
+}
+
 /// Format bytes into human-readable string (MB with 1 decimal)
 fn format_size(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
@@ -2282,6 +2293,14 @@ impl SignedPutHandler {
         use crate::compression::CompressionAlgorithm;
         use fs2::FileExt;
 
+        // Store the ETag exactly as S3 reports it on every later response: quoted.
+        // `extract_etag_from_complete_response` strips the quotes, and a `.meta`
+        // carrying the bare form disagreed with the quoted ETag of the very first
+        // HEAD/GET after completion, which the HEAD path treated as "object changed"
+        // and the range path as a version mismatch.
+        let wire_etag = s3_wire_etag(etag);
+        let etag = wire_etag.as_str();
+
         let multipart_dir = self.cache_dir.join("mpus_in_progress").join(upload_id);
 
         // Early validation - if we don't have the upload directory, skip caching entirely
@@ -2534,6 +2553,30 @@ impl SignedPutHandler {
                 current_offset += part.size;
             }
             offsets
+        };
+
+        // Publish atomically with respect to every other metadata writer. From here
+        // until the `.meta` is renamed into place, the part files are visible under
+        // `ranges/` without a `.meta` that names them; the journal consolidator,
+        // orphan recovery, a HEAD refresh, or a 304 revalidation running in that
+        // window would either treat them as orphans or rewrite the record we are
+        // about to publish. All of those take this lock (the consolidator skips a
+        // held lock; the hybrid writer waits), so holding it closes the window.
+        let publication_lock = match &self.cache_manager {
+            Some(cache_mgr) => match cache_mgr.acquire_metadata_lock(cache_key).await {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    warn!(
+                        "CompleteMultipartUpload succeeded on S3 but the metadata lock could not be acquired: cache_key={}, upload_id={}, error={}, skipping cache finalization",
+                        cache_key, upload_id, e
+                    );
+                    drop(lock_file);
+                    self.cleanup_incomplete_multipart_cache(&multipart_dir, upload_id)
+                        .await;
+                    return Ok(());
+                }
+            },
+            None => None,
         };
 
         // Invalidate existing cache entries before creating new object metadata (Requirements 4.1, 4.2, 4.3, 5.1, 5.2)
@@ -2823,8 +2866,8 @@ impl SignedPutHandler {
         let metadata_json = serde_json::to_string_pretty(&cache_metadata)
             .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))?;
 
-        // Write metadata file atomically using temp file + rename
-        let temp_metadata_file = metadata_file.with_extension("tmp");
+        // Write metadata file atomically using a per-call temp file + rename
+        let temp_metadata_file = crate::cache::unique_metadata_temp_path(&metadata_file);
         tokio::fs::write(&temp_metadata_file, &metadata_json)
             .await
             .map_err(|e| {
@@ -2843,6 +2886,20 @@ impl SignedPutHandler {
             metadata_file.display(),
             cache_metadata.ranges.len()
         );
+
+        // The disk record is now authoritative; every in-memory copy predating it
+        // (a RAM metadata snapshot loaded by an early reader, RAM ranges of an older
+        // version) must be dropped so no reader observes stale or empty metadata.
+        if let Some(cache_mgr) = &self.cache_manager {
+            cache_mgr.invalidate_metadata_cache(cache_key).await;
+            if let Err(e) = cache_mgr.invalidate_ram_ranges(cache_key).await {
+                warn!(
+                    "Failed to drop RAM ranges after multipart publication: cache_key={}, error={}",
+                    cache_key, e
+                );
+            }
+        }
+        drop(publication_lock);
 
         // Write journal entries for size tracking
         // The metadata file is written directly for atomicity, but we need journal entries
@@ -4332,6 +4389,13 @@ impl SignedPutHandler {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn s3_wire_etag_always_yields_the_quoted_form() {
+        assert_eq!(super::s3_wire_etag("abc-7"), "\"abc-7\"");
+        assert_eq!(super::s3_wire_etag("\"abc-7\""), "\"abc-7\"");
+        assert_eq!(super::s3_wire_etag("  \"abc-7\"  "), "\"abc-7\"");
+    }
+
     use super::*;
     use tempfile::TempDir;
 

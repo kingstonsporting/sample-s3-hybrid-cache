@@ -434,6 +434,23 @@ pub struct RangeHandler {
     disk_cache_manager: Arc<tokio::sync::RwLock<DiskCacheManager>>,
 }
 
+/// Whether a client's raw `Range` header names exactly `requested`.
+///
+/// `Some(true)`/`Some(false)` for the absolute `bytes=a-b` form. `None` for suffix
+/// (`bytes=-n`) and open-ended (`bytes=a-`) forms, which cannot be compared without
+/// the object length; callers then forward the header verbatim and rely on the
+/// response-size validation that follows every fallback fetch.
+pub(crate) fn signed_client_range_covers(raw: &str, requested: &RangeSpec) -> Option<bool> {
+    let spec = raw.trim().strip_prefix("bytes=")?.trim();
+    let (start, end) = spec.split_once('-')?;
+    if start.is_empty() || end.is_empty() {
+        return None;
+    }
+    let start: u64 = start.trim().parse().ok()?;
+    let end: u64 = end.trim().parse().ok()?;
+    Some(start == requested.start && end == requested.end)
+}
+
 impl RangeHandler {
     /// Create a new range handler
     pub fn new(
@@ -778,6 +795,14 @@ impl RangeHandler {
                             cache_key, e
                         );
                     }
+
+                    // And the RAM metadata snapshot. `current_etag` is read from the
+                    // disk `.meta` while `metadata` here may be the in-memory copy;
+                    // if the copy is what is stale, leaving it in place makes every
+                    // following GET repeat this invalidation for `refresh_interval`.
+                    self.cache_manager
+                        .invalidate_metadata_cache(cache_key)
+                        .await;
 
                     // Return empty cached ranges, forcing a fetch from S3
                     return Ok(RangeOverlap::all_missing(requested_range));
@@ -2019,6 +2044,24 @@ impl RangeHandler {
             return Ok(Vec::new());
         }
 
+        // Defence in depth: every sub-fetch below replaces the `Range` header. When
+        // the client signed `range`, that rewrite invalidates its signature and S3
+        // answers `403 SignatureDoesNotMatch` (and the old repair path then cached
+        // the error body as range data). Refuse here regardless of which caller
+        // forgot to check, so a routing mistake fails closed on the rewrite and the
+        // caller falls back to forwarding the client's request unchanged.
+        if crate::signed_request_proxy::is_range_signed(headers) {
+            warn!(
+                "Refusing to fetch {} missing range(s) with a rewritten Range header: the client signed 'range' (cache_key={})",
+                missing_ranges.len(),
+                cache_key
+            );
+            return Err(crate::ProxyError::SignedHeaderRewriteRefused {
+                header: "range".to_string(),
+                cache_key: cache_key.to_string(),
+            });
+        }
+
         debug!(
             "Fetching {} missing ranges from S3 in parallel: cache_key={}",
             missing_ranges.len(),
@@ -2369,12 +2412,48 @@ impl RangeHandler {
 
         let fallback_start = std::time::Instant::now();
 
-        // Build S3 request with Range header
+        // Build S3 request with Range header.
+        //
+        // When the client signed `range`, its own header value is forwarded
+        // byte-for-byte (a normalised `bytes=a-b` for a suffix or open-ended request
+        // is a different string and therefore a different signature). That is only
+        // valid when the caller's `requested_range` IS the client's range; a caller
+        // asking for some other extent with signed headers is refused rather than
+        // silently answered with the wrong bytes or a 403.
         let mut s3_headers = headers.clone();
-        s3_headers.insert(
-            "range".to_string(),
-            format!("bytes={}-{}", requested_range.start, requested_range.end),
-        );
+        if crate::signed_request_proxy::is_range_signed(&s3_headers) {
+            let client_range = s3_headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("range"))
+                .map(|(_, v)| v.clone());
+            match client_range
+                .as_deref()
+                .map(|raw| signed_client_range_covers(raw, requested_range).unwrap_or(true))
+            {
+                Some(true) => {
+                    debug!(
+                        "Fallback fetch keeps the client's signed Range header verbatim: range={}-{} cache_key={}",
+                        requested_range.start, requested_range.end, cache_key
+                    );
+                }
+                _ => {
+                    warn!(
+                        "Refusing fallback fetch of range {}-{}: the client signed a different Range header (cache_key={})",
+                        requested_range.start, requested_range.end, cache_key
+                    );
+                    return Err(ProxyError::SignedHeaderRewriteRefused {
+                        header: "range".to_string(),
+                        cache_key: cache_key.to_string(),
+                    });
+                }
+            }
+        } else {
+            s3_headers.retain(|k, _| !k.eq_ignore_ascii_case("range"));
+            s3_headers.insert(
+                "range".to_string(),
+                format!("bytes={}-{}", requested_range.start, requested_range.end),
+            );
+        }
         // Strip the proxy's internal sentinels before sending to S3.
         s3_headers.remove("x-proxy-injected-if-match");
         s3_headers.remove("x-proxy-injected-if-unmodified-since");

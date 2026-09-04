@@ -20,7 +20,7 @@ use crate::{
     },
     s3_client::{
         build_s3_request_context, build_s3_request_context_with_operation, S3Client, S3ClientApi,
-        S3RequestContext, S3ResponseBody,
+        S3ResponseBody,
     },
     tee_stream::TeeStream,
     throttle_stream::ThrottleStream,
@@ -9016,6 +9016,89 @@ impl HttpProxy {
     // HTTP response path via `?` at every call site. Boxing it would ripple through
     // every construction and every `?` site for a toolchain-lint-only change; not
     // worth the churn here. See clippy::result_large_err.
+    /// Cache repair that fails open.
+    ///
+    /// Called when a range the `.meta` names cannot be served as recorded: its file
+    /// is missing, truncated, or fails decompression, or the bytes are shorter than
+    /// the extent. The inconsistent record is evicted from disk and every RAM tier,
+    /// and the client is answered by forwarding ITS OWN request to S3 unchanged. No
+    /// header the client may have signed is touched, so a cache fault can never
+    /// surface as `SignatureDoesNotMatch`. The upstream response is cached by the
+    /// normal signed-range path, which repairs the entry for the next reader.
+    #[allow(clippy::too_many_arguments)]
+    async fn fail_open_after_inconsistent_range(
+        cache_key: &str,
+        cached_start: u64,
+        cached_end: u64,
+        reason: &str,
+        range_spec: &RangeSpec,
+        cache_manager: &Arc<CacheManager>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &str,
+        headers: &HeaderMap,
+        config: &Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
+        cache_manager
+            .evict_inconsistent_range(cache_key, cached_start, cached_end, reason)
+            .await;
+
+        let client_headers: HashMap<String, String> = headers
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let uri: hyper::Uri = match uri.parse() {
+            Ok(uri) => uri,
+            Err(error) => {
+                error!(
+                    "Failed to parse URI while failing open after an inconsistent cached range: uri={}, error={}",
+                    uri, error
+                );
+                return Self::build_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    "Failed to build request URI",
+                    None,
+                );
+            }
+        };
+
+        info!(
+            "Failing open to S3 with the client's original request after evicting an inconsistent cached range: cache_key={}, evicted={}-{}, requested={}-{}, reason={}",
+            cache_key, cached_start, cached_end, range_spec.start, range_spec.end, reason
+        );
+        match Self::forward_signed_range_request(
+            Method::GET,
+            uri,
+            host.to_string(),
+            client_headers,
+            cache_key.to_string(),
+            range_spec.clone(),
+            crate::range_handler::RangeOverlap::all_missing(range_spec),
+            Arc::clone(cache_manager),
+            Arc::clone(range_handler),
+            s3_client,
+            Arc::clone(config),
+            resolved,
+            &None,
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::result_large_err)]
     async fn get_cached_range_data(
         range_spec: &RangeSpec,
@@ -9040,7 +9123,7 @@ impl HttpProxy {
         Response<BoxBody<Bytes, hyper::Error>>,
     > {
         // Track whether data came from RAM cache
-        let mut is_ram_hit = false;
+        let is_ram_hit: bool;
         // Both cache-recovery paths below may need a complete upstream range
         // fetch. Build the request representation once so a cache hole degrades
         // to a miss instead of becoming a response-construction failure.
@@ -9147,184 +9230,31 @@ impl HttpProxy {
                         data
                     }
                     Err(e) => {
-                        debug!("Range file missing ({}), fetching from S3", e);
-
-                        // Fetch the missing range from S3
-                        let range_header =
-                            format!("bytes={}-{}", cached_range.start, cached_range.end);
-                        let mut s3_headers = headers.clone();
-                        // Remove any existing Range header to avoid duplicates
-                        s3_headers.remove("range");
-                        s3_headers.remove("Range");
-                        s3_headers.insert("Range", range_header.parse().unwrap());
-
-                        let s3_headers_map: HashMap<String, String> = s3_headers
-                            .iter()
-                            .map(|(k, v)| {
-                                (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
-                            })
-                            .collect();
-
-                        // Build absolute URI for S3 request. The authority carries any
-                        // explicit upstream port from the signed Host header so the
-                        // recovery refetch dials it and the upstream-override lookup
-                        // keys on host:port (Requirements 3.4, 3.5, 5.1); absent a port
-                        // this is byte-for-byte today's URI.
-                        let host_header = headers
-                            .get(hyper::header::HOST)
-                            .and_then(|v| v.to_str().ok());
-                        let authority = crate::s3_client::build_egress_authority(host, host_header);
-                        let absolute_uri = match format!("https://{}{}", authority, uri).parse() {
-                            Ok(uri) => uri,
-                            Err(e) => {
-                                error!("Failed to parse URI: {}", e);
-                                return Err(Self::build_error_response(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "InternalError",
-                                    "Failed to build request URI",
-                                    None,
-                                ));
-                            }
-                        };
-
-                        let context = S3RequestContext {
-                            method: Method::GET,
-                            uri: absolute_uri,
-                            headers: s3_headers_map,
-                            body: None,
-                            host: host.to_string(),
-                            request_size: None,
-                            operation_type: None,
-                            allow_streaming: true, // Enable streaming for range fetches
-                        };
-
-                        // Admission_Check before buffering the recovery fetch. The
-                        // requested range's byte length is known up front (it's the
-                        // cached range this code is trying to recover), so reserve
-                        // exactly that many bytes — a currently-uncapped
-                        // Buffering_Site named in inflight-memory-accounting's
-                        // Introduction table. Rejection here happens before the S3
-                        // request context above is even built, but the reservation
-                        // must be held across the actual fetch/collect below, so it
-                        // is taken immediately before forwarding.
-                        //
-                        // Claimed through the caller's reservation rather than
-                        // reserved separately: the fetched extent is what the
-                        // response is sliced from (`Bytes::slice` shares the
-                        // allocation), so it is the same memory the caller already
-                        // accounts for. A cached extent WIDER than the client range
-                        // grows that claim by the difference, so the ledger holds
-                        // the larger of the two — the allocation that actually
-                        // exists — and never their sum, which would refuse a
-                        // request whose own reservation was the only thing in the
-                        // way. Requirements: IMA 1.2, 1.3, 2.1, 2.5, 4.2.
-                        let recovery_fetch_bytes =
-                            cached_range.end.saturating_sub(cached_range.start) + 1;
-                        let _recovery_claim =
-                            match s3_client.get_inflight_ledger().claim_overlapping(
-                                recovery_fetch_bytes,
-                                caller_reservation.as_deref_mut(),
-                            ) {
-                                Some(claim) => claim,
-                                None => {
-                                    return Err(Self::proxy_error_to_response(
-                                        &crate::ProxyError::InflightCeilingExceeded {
-                                            ceiling_bytes: s3_client
-                                                .get_inflight_ledger()
-                                                .ceiling_bytes(),
-                                            requested_bytes: recovery_fetch_bytes,
-                                        },
-                                    ));
-                                }
-                            };
-
-                        let s3_response = match s3_client.forward_request(context).await {
-                            Ok(resp) => resp,
-                            Err(e) => {
-                                // A TlsValidated upstream cert failure is a
-                                // non-retryable config error → surface the 400
-                                // (Requirements 4.1-4.3) rather than a 500.
-                                if matches!(
-                                    e,
-                                    crate::ProxyError::UpstreamTlsValidationFailed { .. }
-                                ) {
-                                    return Err(Self::proxy_error_to_response(&e));
-                                }
-                                Self::log_s3_forward_error(&uri, &"GET", &e);
-                                return Err(Self::build_error_response(
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "InternalError",
-                                    "Failed to recover missing cache file.",
-                                    None,
-                                ));
-                            }
-                        };
-
-                        // Keep the collected body as `Bytes`. This previously did
-                        // `.to_vec()` here and `fetched_data.clone()` below for the
-                        // caching task, so a recovery fetch held the range three times
-                        // at peak; both are now refcount operations.
-                        // Requirement: IMA 5.3
-                        let fetched_data = match s3_response.body {
-                            Some(body) => match body.into_bytes().await {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    error!("Failed to collect fetched range body: {}", e);
-                                    return Err(Self::build_error_response(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        "InternalError",
-                                        "Failed to collect response body",
-                                        None,
-                                    ));
-                                }
-                            },
-                            None => Bytes::new(),
-                        };
-
-                        // Cache the fetched range asynchronously
-                        let range_handler_clone = range_handler.clone();
-                        let cache_key_clone = cache_key.to_string();
-                        let start = cached_range.start;
-                        let end = cached_range.end;
-                        let ttl = config.cache.get_ttl;
-                        let data_clone = fetched_data.clone();
-                        let s3_headers_clone = s3_response.headers.clone();
-                        let s3_client_clone = s3_client.clone();
-                        // Reuse the once-per-request resolved settings (Req 8.2), combined
-                        // with the size threshold and built-in denylist (rules-win).
-                        let compression_enabled = range_handler
-                            .get_cache_manager()
-                            .effective_compression(resolved, &cache_key_clone, end - start + 1);
-
-                        tokio::spawn(async move {
-                            // Use the new method to create ObjectMetadata with all S3 response headers
-                            // Note: extract_object_metadata_from_response already extracts total object size
-                            // from Content-Range header, so we should NOT override content_length
-                            let mut metadata = s3_client_clone
-                                .extract_object_metadata_from_response(&s3_headers_clone);
-                            metadata.upload_state = crate::cache_types::UploadState::Complete;
-                            // cumulative_size tracks how much data we've cached, not total object size
-                            metadata.cumulative_size = end - start + 1;
-
-                            if let Err(e) = range_handler_clone
-                                .store_range_new_storage(
-                                    &cache_key_clone,
-                                    start,
-                                    end,
-                                    &data_clone,
-                                    metadata,
-                                    ttl,
-                                    compression_enabled,
-                                )
-                                .await
-                            {
-                                warn!("Failed to cache recovered range {}-{}: {}", start, end, e);
-                            } else {
-                                debug!("Cached recovered range {}-{}", start, end);
-                            }
-                        });
-
-                        fetched_data
+                        // The `.meta` names this range but its bytes cannot be read
+                        // (deleted by a concurrent invalidation, truncated, or failing
+                        // decompression). Never repair it by fetching a synthetic
+                        // sub-range with the client's headers: `range` is a signed
+                        // header for every SDK download, so the rewrite turned a
+                        // valid request into an upstream SignatureDoesNotMatch, and
+                        // the old path then cached the 403 body as range data. Fail
+                        // open: drop the inconsistent record and forward the client's
+                        // own request unchanged.
+                        return Err(Self::fail_open_after_inconsistent_range(
+                            cache_key,
+                            cached_range.start,
+                            cached_range.end,
+                            &format!("cached range bytes unreadable: {}", e),
+                            range_spec,
+                            cache_manager,
+                            range_handler,
+                            Arc::clone(&s3_client),
+                            host,
+                            uri,
+                            headers,
+                            config,
+                            resolved,
+                        )
+                        .await);
                     }
                 }
             };
@@ -9364,12 +9294,22 @@ impl HttpProxy {
                         "Slice bounds error: slice_end={} exceeds data.len()={}, cache_key={}, cached_range={}-{}, requested_range={}-{}",
                         slice_end, data.len(), cache_key, cached_range.start, cached_range.end, range_spec.start, range_spec.end
                     );
-                        return Err(Self::build_error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "InternalError",
-                            "Failed to slice cached range data.",
-                            None,
-                        ));
+                        return Err(Self::fail_open_after_inconsistent_range(
+                            cache_key,
+                            cached_range.start,
+                            cached_range.end,
+                            "cached range shorter than its recorded extent",
+                            range_spec,
+                            cache_manager,
+                            range_handler,
+                            Arc::clone(&s3_client),
+                            host,
+                            uri,
+                            headers,
+                            config,
+                            resolved,
+                        )
+                        .await);
                     }
 
                     // `Bytes::slice` shares the existing allocation, so extracting the
@@ -9393,12 +9333,25 @@ impl HttpProxy {
                     "Sliced data size mismatch: expected {} bytes, got {} bytes, cache_key={}, cached_range={}-{}, requested_range={}-{}",
                     expected_size, sliced_data.len(), cache_key, cached_range.start, cached_range.end, range_spec.start, range_spec.end
                 );
-                return Err(Self::build_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    "Sliced data size validation failed.",
-                    None,
-                ));
+                // The cached bytes do not match the recorded extent. Do not clamp,
+                // do not keep them: evict the record and answer from S3 with the
+                // client's own request.
+                return Err(Self::fail_open_after_inconsistent_range(
+                    cache_key,
+                    cached_range.start,
+                    cached_range.end,
+                    "cached range shorter than its recorded extent",
+                    range_spec,
+                    cache_manager,
+                    range_handler,
+                    Arc::clone(&s3_client),
+                    host,
+                    uri,
+                    headers,
+                    config,
+                    resolved,
+                )
+                .await);
             }
 
             // Create simple metrics for single range (100% cache efficiency)
@@ -13433,6 +13386,35 @@ impl HttpProxy {
             .await;
         }
 
+        // A signed `Range` cannot be split into per-hole sub-fetches: `fetch_missing_ranges`
+        // replaces the header and would invalidate the client's signature (production
+        // saw exactly this after a 304 left a partially covered overlap). Fail open by
+        // fetching the client's whole range with its request unchanged, which also
+        // re-caches the extent, and leave the signed header set untouched.
+        if crate::signed_request_proxy::is_range_signed(&headers) {
+            debug!(
+                "Partially cached signed range request: forwarding the client's request unchanged instead of fetching {} hole(s): cache_key={}",
+                overlap.missing_ranges.len(),
+                cache_key
+            );
+            cache_manager.record_incomplete_range_fallback();
+            return Self::stream_range_from_s3_with_caching(
+                method,
+                uri,
+                host,
+                headers,
+                cache_key,
+                range_spec,
+                range_handler,
+                s3_client,
+                config,
+                resolved,
+                coordination_guard,
+                permit,
+            )
+            .await;
+        }
+
         // Partially cached case - consolidate missing ranges - Requirement 1.2
         // Note: Partial cache hits still require buffering to merge cached + fetched data
         debug!(
@@ -13705,13 +13687,24 @@ impl HttpProxy {
 
         // Build S3 request context with range header and streaming enabled
         let mut s3_headers = headers.clone();
-        // Remove any existing Range header (case-insensitive) to avoid duplicates
-        s3_headers.retain(|k, _| k.to_lowercase() != "range");
-        // Insert new Range header with proper capitalization
-        s3_headers.insert(
-            "Range".to_string(),
-            format!("bytes={}-{}", range_spec.start, range_spec.end),
-        );
+        if crate::signed_request_proxy::is_range_signed(&s3_headers) {
+            // The client signed `range`: its header goes upstream byte-for-byte.
+            // `range_spec` was parsed from that same header, so caching the response
+            // under it below stays correct, and a suffix or open-ended form keeps the
+            // exact string the signature covers.
+            debug!(
+                "Forwarding the client's signed Range header verbatim: range={}-{} cache_key={}",
+                range_spec.start, range_spec.end, cache_key
+            );
+        } else {
+            // Remove any existing Range header (case-insensitive) to avoid duplicates
+            s3_headers.retain(|k, _| k.to_lowercase() != "range");
+            // Insert new Range header with proper capitalization
+            s3_headers.insert(
+                "Range".to_string(),
+                format!("bytes={}-{}", range_spec.start, range_spec.end),
+            );
+        }
 
         // Strip the internal sentinels before sending to S3. They are only meaningful
         // inside the proxy to signal that `if-match` and/or `if-unmodified-since` were

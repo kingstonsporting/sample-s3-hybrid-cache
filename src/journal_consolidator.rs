@@ -577,6 +577,10 @@ pub struct JournalConsolidator {
     size_state_path: PathBuf,
     /// Reference to cache manager for eviction (Weak to avoid circular references)
     cache_manager: Mutex<Option<Weak<crate::cache::CacheManager>>>,
+    /// RAM metadata tier to invalidate whenever this consolidator rewrites a `.meta`.
+    /// Without it, readers keep a stale in-memory snapshot for `refresh_interval` and
+    /// `RangeHandler::find_cached_ranges` treats the disk record as an ETag mismatch.
+    metadata_cache: Mutex<Option<Arc<crate::metadata_cache::MetadataCache>>>,
     /// Ranges that were evicted and should be immediately marked as stale in journals
     /// Key: cache_key, Value: Vec<(start, end)> of evicted ranges
     /// **Validates: Requirement 4.2**
@@ -639,6 +643,7 @@ impl JournalConsolidator {
             config,
             size_state_path,
             cache_manager: Mutex::new(None),
+            metadata_cache: Mutex::new(None),
             evicted_ranges: Mutex::new(HashMap::new()),
             consolidation_lock_file: Mutex::new(None),
             size_accumulator,
@@ -652,6 +657,18 @@ impl JournalConsolidator {
     ///
     /// This must be called after the CacheManager is created to establish the
     /// bidirectional relationship. Uses Weak reference to avoid circular references.
+    /// Attach the RAM metadata tier so every consolidated `.meta` write drops the
+    /// corresponding in-memory snapshot.
+    pub fn set_metadata_cache(&self, metadata_cache: Arc<crate::metadata_cache::MetadataCache>) {
+        if let Ok(mut guard) = self.metadata_cache.lock() {
+            *guard = Some(metadata_cache);
+        }
+    }
+
+    fn metadata_cache(&self) -> Option<Arc<crate::metadata_cache::MetadataCache>> {
+        self.metadata_cache.lock().ok().and_then(|g| g.clone())
+    }
+
     pub fn set_cache_manager(&self, cache_manager: Weak<crate::cache::CacheManager>) {
         if let Ok(mut guard) = self.cache_manager.lock() {
             *guard = Some(cache_manager);
@@ -3757,10 +3774,19 @@ impl JournalConsolidator {
             // Create new metadata
             let now = SystemTime::now();
 
-            // Try to get object_metadata from journal entries (first one that has it)
+            // Take object_metadata from the journal entries, preferring one that
+            // carries an ETag: an ETag-less entry must never define the object's
+            // identity when a sibling entry knows it.
             let object_metadata = journal_entries
                 .iter()
-                .find_map(|entry| entry.object_metadata.clone())
+                .filter_map(|entry| entry.object_metadata.as_ref())
+                .find(|metadata| !metadata.etag.is_empty())
+                .or_else(|| {
+                    journal_entries
+                        .iter()
+                        .find_map(|entry| entry.object_metadata.as_ref())
+                })
+                .cloned()
                 .unwrap_or_else(|| {
                     debug!(
                         "No object_metadata found in journal entries for cache_key={}, using default",
@@ -3867,6 +3893,11 @@ impl JournalConsolidator {
             "Successfully wrote metadata to disk (atomic): cache_key={}, path={:?}",
             metadata.cache_key, metadata_path
         );
+
+        // The disk record changed; the RAM snapshot of it is now stale.
+        if let Some(metadata_cache) = self.metadata_cache() {
+            metadata_cache.invalidate(&metadata.cache_key).await;
+        }
 
         Ok(())
     }
