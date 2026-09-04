@@ -1210,9 +1210,36 @@ impl DiskCacheManager {
         let uncompressed_size = data.len() as u64;
         // When the client requests a range larger than the object (e.g., Range: bytes=0-52428799
         // for a 10-byte object), S3 returns only the available bytes with Content-Range: bytes 0-9/10.
-        // Clamp the range end to match the actual data received from S3.
+        // Only then may the range end be clamped to the data received, and only because S3's
+        // own Content-Range says the object ends there. Any other short body (a truncated
+        // upstream stream, an error document returned with a 2xx, a status-unchecked repair
+        // fetch) is NOT a shorter object, and retaining it as a valid sub-range is how a
+        // 7,962-byte error body became "the final part" of a 4.4 GB object in production.
         let end = if uncompressed_size < (end - start + 1) && uncompressed_size > 0 {
             let clamped_end = start + uncompressed_size - 1;
+            let confirmed_by_content_range =
+                content_range_end(&object_metadata.response_headers) == Some(clamped_end);
+            if !confirmed_by_content_range {
+                error!(
+                    "Refusing to cache a short range: key={}, range={}-{}, data_size={}, content_range={:?} (S3 did not report the object ending at byte {})",
+                    cache_key,
+                    start,
+                    end,
+                    uncompressed_size,
+                    object_metadata
+                        .response_headers
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+                        .map(|(_, v)| v.as_str()),
+                    clamped_end
+                );
+                return Err(ProxyError::CacheError(format!(
+                    "Data size ({}) is shorter than range size ({}) and Content-Range does not confirm the object ends at byte {}",
+                    uncompressed_size,
+                    end - start + 1,
+                    clamped_end
+                )));
+            }
             info!(
                 "Range clamped to actual data size: key={}, requested_end={}, clamped_end={}, data_size={}",
                 cache_key, end, clamped_end, uncompressed_size
@@ -1238,6 +1265,30 @@ impl DiskCacheManager {
             "Range validation passed: key={}, range={}-{}, size={} bytes",
             cache_key, start, end, uncompressed_size
         );
+
+        // A range that arrives WITHOUT an ETag (a non-2xx or otherwise ETag-less
+        // upstream response reaching a store path) must never be published over
+        // metadata that carries one, in either the direct or the journal write
+        // mode. In production a 403 error body stored this way displaced 526 valid
+        // multipart ranges and left a `.meta` whose empty ETag every reader then
+        // treated as a version mismatch.
+        if object_metadata.etag.is_empty() {
+            let metadata_file_path = self.get_new_metadata_file_path(cache_key);
+            if let Ok(existing) = std::fs::read_to_string(&metadata_file_path) {
+                if let Ok(existing) = serde_json::from_str::<NewCacheMetadata>(&existing) {
+                    if !existing.object_metadata.etag.is_empty() {
+                        warn!(
+                            "Refusing to cache a range without an ETag over metadata that has one: key={}, range={}-{}, existing_etag={}",
+                            cache_key, start, end, existing.object_metadata.etag
+                        );
+                        return Err(ProxyError::CacheError(format!(
+                            "Refusing to cache range {}-{} without an ETag for key {} (existing ETag {})",
+                            start, end, cache_key, existing.object_metadata.etag
+                        )));
+                    }
+                }
+            }
+        }
 
         // Step 1: Compress the range data if appropriate.
         // `compression_enabled` here is the final effective-compression decision
@@ -1550,7 +1601,28 @@ impl DiskCacheManager {
                                 metadata.object_metadata.etag
                             );
 
-                            // Verify object metadata matches
+                            // Verify object metadata matches.
+                            //
+                            // An incoming range WITHOUT an ETag (a non-2xx or otherwise
+                            // ETag-less upstream response reaching a store path) must
+                            // never evict ranges that carry one. In production a 403
+                            // error body stored through this path wiped 526 valid
+                            // multipart ranges and left a `.meta` with an empty ETag
+                            // that every reader then treated as a version mismatch.
+                            if object_metadata.etag.is_empty()
+                                && !metadata.object_metadata.etag.is_empty()
+                            {
+                                let _ = lock_file.unlock();
+                                let _ = std::fs::remove_file(&range_tmp_path);
+                                warn!(
+                                    "Refusing to cache a range without an ETag over metadata that has one: key={}, range={}-{}, existing_etag={}",
+                                    cache_key, start, end, metadata.object_metadata.etag
+                                );
+                                return Err(ProxyError::CacheError(format!(
+                                    "Refusing to cache range {}-{} without an ETag for key {} (existing ETag {})",
+                                    start, end, cache_key, metadata.object_metadata.etag
+                                )));
+                            }
                             if metadata.object_metadata.etag != object_metadata.etag {
                                 warn!(
                                     "ETag mismatch detected: key={}, existing_etag={}, new_etag={} - invalidating existing ranges",
@@ -8119,6 +8191,21 @@ pub fn get_sharded_path(
 ///
 /// # Requirements
 /// Implements Requirements 5.3, 5.5
+/// The inclusive end byte named by a `Content-Range: bytes <start>-<end>/<total>`
+/// response header, if the headers carry a parseable one.
+pub(crate) fn content_range_end(
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<u64> {
+    let value = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-range"))
+        .map(|(_, v)| v.trim())?;
+    let spec = value.strip_prefix("bytes ")?;
+    let (range, _total) = spec.split_once('/')?;
+    let (_start, end) = range.split_once('-')?;
+    end.trim().parse().ok()
+}
+
 pub fn normalize_cache_key(cache_key: &str) -> String {
     // Remove leading slash if present
     cache_key.strip_prefix('/').unwrap_or(cache_key).to_string()

@@ -19,6 +19,15 @@ pub enum ProxyError {
     #[error("Cache error: {0}")]
     CacheError(String),
 
+    /// A cache repair path was asked to rewrite a request header that the client
+    /// covered with its SigV4 signature. Doing so would turn a valid client request
+    /// into an upstream `SignatureDoesNotMatch`, so the repair is refused and the
+    /// caller must fail open by forwarding the client's original request unchanged.
+    #[error(
+        "Refusing to rewrite signed request header '{header}' for cache repair: key={cache_key}"
+    )]
+    SignedHeaderRewriteRefused { header: String, cache_key: String },
+
     #[error("Compression error: {0}")]
     CompressionError(String),
 

@@ -37,6 +37,28 @@ fn is_head_fresh(
         && now.duration_since(anchor).unwrap_or(Duration::ZERO) <= current_head_ttl
 }
 
+/// A per-call temporary path for an atomic `.meta` replace.
+///
+/// Every metadata writer used to share `<name>.meta.tmp`. Two concurrent writers
+/// then raced on one file: the second `rename` failed with ENOENT, or worse, one
+/// writer renamed the other's half-written bytes into place and left a torn `.meta`
+/// that parsed as corrupt and was healed by deletion. Unique names keep the
+/// write+rename of each writer atomic on its own.
+pub(crate) fn unique_metadata_temp_path(metadata_path: &std::path::Path) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = metadata_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "metadata".to_string());
+    metadata_path.with_file_name(format!(
+        "{}.tmp.{}.{}",
+        file_name,
+        std::process::id(),
+        sequence
+    ))
+}
+
 /// Maximum concurrent objects processed in perform_eviction_with_lock()
 const OBJECT_CONCURRENCY_LIMIT: usize = 8;
 
@@ -950,6 +972,10 @@ struct JournalComponents {
     consolidator: Arc<crate::journal_consolidator::JournalConsolidator>,
     hybrid_writer: Arc<tokio::sync::Mutex<crate::hybrid_metadata_writer::HybridMetadataWriter>>,
     cache_hit_buffer: Arc<crate::cache_hit_update_buffer::CacheHitUpdateBuffer>,
+    /// The per-key metadata lock shared by the hybrid writer and the consolidator.
+    /// Exposed through [`CacheManager::acquire_metadata_lock`] so a publication that
+    /// writes a `.meta` directly (multipart completion) is serialised against them.
+    lock_manager: Arc<crate::metadata_lock_manager::MetadataLockManager>,
 }
 
 /// An evicted range, carrying everything both the accumulator debit and the Remove
@@ -1580,11 +1606,17 @@ impl CacheManager {
         let hybrid_writer = Arc::new(tokio::sync::Mutex::new(
             crate::hybrid_metadata_writer::HybridMetadataWriter::new(
                 self.cache_dir.clone(),
-                lock_manager,
+                Arc::clone(&lock_manager),
                 journal_manager,
                 consolidation_trigger,
             ),
         ));
+
+        // Every `.meta` the consolidator rewrites must also drop the RAM metadata
+        // snapshot, or readers keep comparing a stale in-memory ETag against the
+        // disk record (`RangeHandler::find_cached_ranges`) and invalidating on
+        // every request.
+        consolidator.set_metadata_cache(Arc::clone(&self.metadata_cache));
 
         // Create CacheHitUpdateBuffer for journal-based cache-hit updates
         let cache_hit_buffer =
@@ -1603,7 +1635,55 @@ impl CacheManager {
             consolidator,
             hybrid_writer,
             cache_hit_buffer,
+            lock_manager,
         }
+    }
+
+    /// Acquire the per-key metadata lock used by the hybrid writer and the journal
+    /// consolidator.
+    ///
+    /// Hold it across any sequence that must publish a `.meta` and its range files as
+    /// one unit (multipart completion, HEAD field refresh, write-tier graduation), so
+    /// a concurrent consolidation or revalidation cannot interleave a read-modify-write
+    /// and either resurrect stale metadata or observe the entry half-published.
+    pub async fn acquire_metadata_lock(
+        &self,
+        cache_key: &str,
+    ) -> Result<crate::metadata_lock_manager::MetadataLock> {
+        self.journal_components()
+            .lock_manager
+            .acquire_lock(cache_key)
+            .await
+    }
+
+    /// Evict one cached range whose bytes on disk no longer match what the `.meta`
+    /// records (missing, truncated, or failing decompression), and drop every
+    /// in-memory copy of it, so no reader can be served the inconsistent bytes and no
+    /// later lookup will trust the stale record.
+    pub async fn evict_inconsistent_range(
+        &self,
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        reason: &str,
+    ) {
+        warn!(
+            "Evicting inconsistent cached range: cache_key={}, range={}-{}, reason={}",
+            cache_key, start, end, reason
+        );
+        if let Err(e) = self.evict_range(cache_key, start, end).await {
+            warn!(
+                "Failed to evict inconsistent cached range (continuing to fail open): cache_key={}, range={}-{}, error={}",
+                cache_key, start, end, e
+            );
+        }
+        if let Err(e) = self.remove_from_ram_cache_unified(cache_key).await {
+            warn!(
+                "Failed to drop RAM ranges after evicting an inconsistent range: cache_key={}, error={}",
+                cache_key, e
+            );
+        }
+        self.metadata_cache.invalidate(cache_key).await;
     }
 
     /// Create a new cache manager with default compression settings
@@ -2482,6 +2562,11 @@ impl CacheManager {
             "Invalidating cache hierarchy (unified) for key: {}",
             cache_key
         );
+
+        // The RAM metadata snapshot must go with the disk record. Leaving it behind
+        // made `find_cached_ranges` compare a stale in-memory ETag against the disk
+        // `.meta` on every GET for up to `refresh_interval` and re-invalidate each time.
+        self.metadata_cache.invalidate(cache_key).await;
 
         // Remove from RAM cache if enabled - unified invalidation for both GET and HEAD entries
         if self.ram_cache_enabled {
@@ -6827,18 +6912,25 @@ impl CacheManager {
                 cache_key
             );
         } else {
-            // Update metadata
+            // Update metadata atomically (write a unique temp file, then rename)
             let json = serde_json::to_string_pretty(&metadata).map_err(|e| {
                 ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
             })?;
-            std::fs::write(&metadata_path, json)
+            let temp_path = unique_metadata_temp_path(&metadata_path);
+            std::fs::write(&temp_path, json)
                 .map_err(|e| ProxyError::CacheError(format!("Failed to write metadata: {}", e)))?;
+            std::fs::rename(&temp_path, &metadata_path).map_err(|e| {
+                let _ = std::fs::remove_file(&temp_path);
+                ProxyError::CacheError(format!("Failed to rename metadata: {}", e))
+            })?;
         }
 
         // Release lock (automatic on drop)
         lock_file
             .unlock()
             .map_err(|e| ProxyError::CacheError(format!("Failed to release lock: {}", e)))?;
+
+        self.metadata_cache.invalidate(cache_key).await;
 
         Ok(())
     }
@@ -8501,6 +8593,11 @@ impl CacheManager {
     ) -> Result<crate::cache_types::NewCacheMetadata> {
         let metadata_path = self.get_new_metadata_file_path(cache_key);
 
+        // Read-modify-write under the per-key metadata lock: a concurrent 304
+        // revalidation, consolidation, or multipart publication must not be
+        // overwritten by this HEAD refresh (or vice versa).
+        let _lock = self.acquire_metadata_lock(cache_key).await?;
+
         // Read existing metadata
         let mut metadata = self
             .read_new_cache_metadata_from_disk(&metadata_path)
@@ -8585,15 +8682,19 @@ impl CacheManager {
             Self::strip_response_scoped_headers(&metadata.object_metadata.response_headers);
 
         // Write back atomically
-        let temp_path = metadata_path.with_extension("meta.tmp");
+        let temp_path = unique_metadata_temp_path(&metadata_path);
         let json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| ProxyError::CacheError(format!("Failed to serialize metadata: {}", e)))?;
 
         std::fs::write(&temp_path, &json)
             .map_err(|e| ProxyError::CacheError(format!("Failed to write temp metadata: {}", e)))?;
 
-        std::fs::rename(&temp_path, &metadata_path)
-            .map_err(|e| ProxyError::CacheError(format!("Failed to rename metadata: {}", e)))?;
+        std::fs::rename(&temp_path, &metadata_path).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            ProxyError::CacheError(format!("Failed to rename metadata: {}", e))
+        })?;
+
+        self.metadata_cache.invalidate(cache_key).await;
 
         Ok(metadata)
     }
@@ -10513,7 +10614,9 @@ impl CacheManager {
         metadata: &crate::cache_types::NewCacheMetadata,
     ) -> Result<()> {
         let metadata_file_path = self.get_new_metadata_file_path(&metadata.cache_key);
-        let metadata_tmp_path = metadata_file_path.with_extension("meta.tmp");
+        // A per-call temp name: two writers sharing one `.tmp` path can rename each
+        // other's half-written file into place (a torn `.meta`), or fail with ENOENT.
+        let metadata_tmp_path = unique_metadata_temp_path(&metadata_file_path);
 
         // Ensure objects directory exists
         if let Some(parent) = metadata_file_path.parent() {
@@ -10906,7 +11009,29 @@ impl CacheManager {
         // R1.4: only the `.meta` is rewritten. No range file is moved, rewritten, or
         // deleted by graduation — the bytes are already in the right place and only
         // their tier changes.
-        if let Err(e) = self.store_new_metadata(&metadata).await {
+        //
+        // Publish under the per-key metadata lock, and only if the record on disk
+        // still needs it. The unlocked read above is the hot-path fast exit; the
+        // write must not clobber a concurrent 304 revalidation, consolidation, or
+        // multipart publication that landed in between.
+        let lock = self.acquire_metadata_lock(cache_key).await?;
+        let still_write_cached = std::fs::read_to_string(&metadata_file_path)
+            .ok()
+            .and_then(|content| {
+                serde_json::from_str::<crate::cache_types::NewCacheMetadata>(&content).ok()
+            })
+            .is_some_and(|current| current.object_metadata.is_write_cached);
+        if !still_write_cached {
+            drop(lock);
+            debug!(
+                "Write-cache graduation already applied by a concurrent writer: {}",
+                cache_key
+            );
+            return Ok(false);
+        }
+        let stored = self.store_new_metadata(&metadata).await;
+        drop(lock);
+        if let Err(e) = stored {
             return Err(ProxyError::CacheError(format!(
                 "Failed to store updated metadata for write cache TTL refresh: cache_key={}, error={}",
                 cache_key, e
