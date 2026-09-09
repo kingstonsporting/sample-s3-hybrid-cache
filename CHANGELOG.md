@@ -5,6 +5,18 @@ All notable changes to Hybrid Cache for Amazon S3 will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Streaming signed uploads that arrive with `Transfer-Encoding: chunked` (PyArrow /
+  AWS CRT `UploadPart` with `aws-chunked` payloads) are re-framed as HTTP chunked on
+  the upstream socket. Hyper decodes inbound chunked bodies into data frames; copying
+  `Transfer-Encoding` and writing those frames raw made S3 treat the inner
+  `aws-chunked` entity as HTTP framing and return `IncompleteBody`. Disabling write
+  cache does not avoid the path: it uses the same streaming forwarder. `Content-Length`
+  bodies are unchanged.
+
 ## [2.8.0] - 2026-08-31
 
 **Upgrade impact:** expired reads revalidate instead of re-downloading, so body transfers fall

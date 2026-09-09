@@ -170,7 +170,9 @@ In all three shapes the correctness gates guarantee the same invariant: **the ca
 
 ## aws-chunked bodies
 
-AWS CLI and SDKs wrap `UploadPart` bodies in aws-chunked transfer encoding. The proxy forwards the chunked body **unmodified** to S3 (so the SigV4 signature over the original bytes stays valid) and **separately decodes** for caching.
+AWS CLI and SDKs wrap `UploadPart` bodies in aws-chunked transfer encoding. The proxy forwards the **aws-chunked entity** unmodified to S3 (so the SigV4 signature over those bytes stays valid) and **separately decodes** for caching.
+
+HTTP `Transfer-Encoding: chunked` is hop-by-hop. Hyper strips that framing into data frames before the streaming forwarder runs. The forwarder copies the original headers (including `Transfer-Encoding`) and **re-encodes HTTP chunks on the upstream socket**, including the last-chunk terminator and any HTTP trailers. `Content-Length` uploads are still copied byte-for-byte.
 
 Both the multipart path (`handle_upload_part`) and the non-multipart PUT path (`handle_with_caching`) use the shared `crate::aws_chunked_decoder` module:
 
@@ -178,7 +180,7 @@ Both the multipart path (`handle_upload_part`) and the non-multipart PUT path (`
 - `decode_aws_chunked(&bytes)` — returns decoded bytes or an error.
 - `get_decoded_content_length(&headers)` — reads `x-amz-decoded-content-length` if present.
 
-If the header says the decoded body should be N bytes and the decoder produces M ≠ N, the proxy skips caching that part and records `record_cache_bypass("aws_chunked_decode_error")`. S3 still gets the original chunked body; the cache just refuses to cache potentially-wrong bytes.
+If the header says the decoded body should be N bytes and the decoder produces M ≠ N, the proxy skips caching that part and records `record_cache_bypass("aws_chunked_decode_error")`. S3 still gets the aws-chunked entity; the cache just refuses to cache potentially-wrong bytes.
 
 **Do not reinvent chunk parsing.** An earlier version of `handle_upload_part` had its own byte-sniffing stripper, which was replaced in 1.11.0 with a call into the shared decoder.
 

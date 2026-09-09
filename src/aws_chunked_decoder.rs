@@ -19,8 +19,8 @@
 //!
 //! # When to use this module
 //!
-//! Any PUT/UploadPart code path that needs to cache the *decoded* body while
-//! forwarding the *original* (chunked, still-signature-valid) body to S3. Both
+//! Any PUT/UploadPart code path that needs to cache the *decoded* object bytes
+//! while forwarding the aws-chunked entity (still signature-valid) to S3. Both
 //! the non-multipart PUT path (`handle_with_caching`) and the multipart
 //! UploadPart path (`handle_upload_part`) use this module for that exact split.
 //!
@@ -445,10 +445,10 @@ enum DecoderState {
 /// calls is a partial chunk-header or trailer line (bounded by
 /// [`MAX_TRAILER_SECTION_BYTES`]).
 ///
-/// It is used **only** on the cache tee branch of the streaming write path; the
-/// upstream always receives the original chunked bytes verbatim. The whole-buffer
-/// [`decode_aws_chunked`] is retained as the buffered path and the equivalence
-/// oracle in tests.
+/// It is used **only** on the cache tee branch of the streaming write path. The
+/// tee receives the client entity (aws-chunked payload included), not HTTP
+/// chunk overhead. The whole-buffer [`decode_aws_chunked`] is retained as the
+/// buffered path and the equivalence oracle in tests.
 ///
 /// # Usage
 ///

@@ -534,14 +534,16 @@ pub async fn forward_signed_request_bounded_with_ledger(
     .await
 }
 
-/// Stream a request that only needs verbatim forwarding to the upstream.
+/// Stream a request to the upstream without a cache tee or a buffered body.
 ///
 /// This is the non-buffering counterpart to
 /// [`forward_signed_request_bounded_with_ledger`]. It decomposes the inbound
-/// request and forwards its original body frame-by-frame with `tee = None`, so it
-/// neither materializes the body nor accepts a ledger parameter. Use it for
-/// forward-only callers; callers that need to inspect or retain the complete body
-/// must use the bounded forward instead.
+/// request and forwards with `tee = None`, so it neither materializes the body
+/// nor accepts a ledger parameter. Hop-by-hop `Transfer-Encoding: chunked` is
+/// still re-encoded by [`forward_signed_request_streaming`]; `Content-Length`
+/// bodies are written byte-for-byte. Use it for forward-only callers; callers
+/// that need to inspect or retain the complete body must use the bounded
+/// forward instead.
 pub async fn forward_signed_request_streaming_verbatim(
     req: Request<hyper::body::Incoming>,
     target_host: &str,
@@ -639,10 +641,17 @@ pub async fn forward_signed_request_with_body(
 /// `headers.iter()` order and casing, and the same Referer-injection rules. This
 /// is load-bearing for SigV4 — any drift in header order, casing, or values
 /// invalidates the signature (Requirements 4.1, 4.2, 4.3, 4.4). Only the body
-/// handling changes: each client body frame is written to the upstream verbatim
-/// with an awaited `write_all`, so the proxy never holds the whole body in memory
+/// handling changes: each client body frame is written with an awaited
+/// `write_all`, so the proxy never holds the whole body in memory
 /// (Requirements 1.1, 1.2, 1.3) and the awaited write provides the primary
 /// backpressure to the client (Requirement 2.1).
+///
+/// `Transfer-Encoding: chunked` is hop-by-hop. Hyper has already stripped that
+/// framing into `Frame::data` / `Frame::trailers` by the time this function
+/// runs. Those frames are re-encoded as HTTP chunks on the upstream socket so
+/// S3 still sees a terminated chunked body; the cache tee still receives the
+/// entity bytes (including an aws-chunked payload). `Content-Length` bodies
+/// are written byte-for-byte.
 ///
 /// The upstream connection, transport selection, and the
 /// `UpstreamTlsValidationFailed` mapping are unchanged — they live entirely in
@@ -658,13 +667,14 @@ pub async fn forward_signed_request_with_body(
 ///   "no cap" for the already-buffered CompleteMultipartUpload caller and can
 ///   never trip either check.
 /// * `tee` — optional cache tee (`None` means no caching). When `Some`, each
-///   frame forwarded to the upstream is also sent to this bounded channel using
-///   the `TeeStream` discipline (`try_send`; on `Full` an awaited `send`; on
-///   `Closed` the tee is dropped and forwarding continues verbatim). The bounded
-///   channel plus one in-flight frame is the whole per-request streaming memory
-///   budget (Req 2.2, 2.3, 7.1, 7.3). The background cache task that *consumes*
-///   this channel (incremental decode + `WriteCacheRangeSink`) is wired in a
-///   later task; this function only owns the send side.
+///   data frame's entity bytes are sent to this bounded channel using the
+///   `TeeStream` discipline (`try_send`; on `Full` an awaited `send`; on
+///   `Closed` the tee is dropped and forwarding continues). HTTP chunk
+///   overhead is not tee'd. The bounded channel plus one in-flight frame is
+///   the whole per-request streaming memory budget (Req 2.2, 2.3, 7.1, 7.3).
+///   The background cache task that *consumes* this channel (incremental
+///   decode + `WriteCacheRangeSink`) is wired in a later task; this function
+///   only owns the send side.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_signed_request_streaming<B>(
     method: &hyper::Method,
@@ -796,21 +806,24 @@ where
         .await
         .map_err(|e| ProxyError::HttpError(format!("Failed to write request headers: {}", e)))?;
 
-    // Stream the body frame-by-frame, verbatim. The awaited `write_all` is the
+    // Stream the body frame-by-frame. The awaited `write_all` is the
     // primary backpressure source: the next client frame is not pulled until the
     // upstream socket accepts the current one (Requirement 2.1), and no whole-body
     // buffer is ever materialized (Requirements 1.1, 1.2, 1.3, 4.1, 4.3).
     //
-    // `sent` tracks the running count of body bytes forwarded so the Body_Size_Cap
-    // is enforced mid-stream without buffering the whole body (Req 8.2, 8.3): on
-    // exceeding `cap` we stop reading the client body and fail with the same 413
-    // `EntityTooLarge` behaviour `read_request_body_bounded` produces, before
-    // writing the offending frame.
+    // `sent` tracks the running count of *entity* bytes forwarded so the
+    // Body_Size_Cap is enforced mid-stream without buffering the whole body
+    // (Req 8.2, 8.3): on exceeding `cap` we stop reading the client body and fail
+    // with the same 413 `EntityTooLarge` behaviour `read_request_body_bounded`
+    // produces, before writing the offending frame. HTTP chunk size lines are
+    // not counted.
     let mut body = body;
     // `tee` is rebound mutable so the channel-closed branch below can drop it
-    // (set it to `None`) and stop teeing while continuing to forward verbatim.
+    // (set it to `None`) and stop teeing while continuing to forward.
     let mut tee = tee;
     let mut sent: u64 = 0;
+    let is_http_chunked = request_is_http_chunked(headers);
+    let mut http_chunked_trailers: Option<hyper::HeaderMap> = None;
     // Observability for the streaming-write tuning question (write_cache_tee_channel_depth):
     // record the body-frame size distribution the tee actually sees and how often the
     // bounded tee channel backpressured (`Full` → awaited send). `tee_full_waits > 0`
@@ -821,85 +834,102 @@ where
     while let Some(frame) = body.frame().await {
         let frame = frame
             .map_err(|e| ProxyError::HttpError(format!("Failed to read request body: {}", e)))?;
-        // Only data frames carry body bytes; non-data frames (e.g. trailers) carry no
-        // entity bytes to forward.
-        if let Ok(data) = frame.into_data() {
-            if data.is_empty() {
-                continue;
-            }
-            frame_count += 1;
-            if data.len() > max_frame {
-                max_frame = data.len();
-            }
-            // Running cap enforcement (Req 8.2). `saturating_add` makes the
-            // `cap == u64::MAX` (no-cap) callers safe: the sum caps at `u64::MAX` and
-            // `u64::MAX > u64::MAX` is false, so they never trip this check.
-            if sent.saturating_add(data.len() as u64) > cap {
-                warn!(
-                    sent_bytes = sent,
-                    chunk_bytes = data.len(),
-                    max_bytes = cap,
-                    content_length = ?content_length_hint,
-                    "Streamed request body exceeds S3 upload size limit"
-                );
-                return Err(ProxyError::RequestBodyTooLarge {
-                    content_length: content_length_hint,
-                    max_bytes: cap,
-                });
-            }
-            // Forward the frame to the upstream verbatim. This awaited `write_all`
-            // is the primary backpressure source and must happen for every forwarded
-            // frame regardless of the tee (Req 4.1, 4.3, 2.1).
-            stream.write_all(&data).await.map_err(|e| {
-                ProxyError::HttpError(format!("Failed to write request body: {}", e))
-            })?;
-            sent = sent.saturating_add(data.len() as u64);
+        match frame.into_data() {
+            Ok(data) => {
+                if data.is_empty() {
+                    continue;
+                }
+                frame_count += 1;
+                if data.len() > max_frame {
+                    max_frame = data.len();
+                }
+                // Running cap enforcement (Req 8.2). `saturating_add` makes the
+                // `cap == u64::MAX` (no-cap) callers safe: the sum caps at `u64::MAX` and
+                // `u64::MAX > u64::MAX` is false, so they never trip this check.
+                if sent.saturating_add(data.len() as u64) > cap {
+                    warn!(
+                        sent_bytes = sent,
+                        chunk_bytes = data.len(),
+                        max_bytes = cap,
+                        content_length = ?content_length_hint,
+                        "Streamed request body exceeds S3 upload size limit"
+                    );
+                    return Err(ProxyError::RequestBodyTooLarge {
+                        content_length: content_length_hint,
+                        max_bytes: cap,
+                    });
+                }
+                // This awaited write is the primary backpressure source and must
+                // happen for every forwarded frame regardless of the tee
+                // (Req 4.1, 4.3, 2.1).
+                if is_http_chunked {
+                    write_http_chunked_data(&mut stream, &data).await?;
+                } else {
+                    stream.write_all(&data).await.map_err(|e| {
+                        ProxyError::HttpError(format!("Failed to write request body: {e}"))
+                    })?;
+                }
+                sent = sent.saturating_add(data.len() as u64);
 
-            // Tee the forwarded frame to the cache, applying the same bounded-channel
-            // discipline as `TeeStream` on the GET path. Only frames actually
-            // forwarded to the upstream are tee'd (a frame rejected by the cap check
-            // above returns before reaching here, so it is never tee'd). The tee
-            // receives a cheap `Bytes` clone (a refcount bump); the upstream write
-            // above already used the original bytes verbatim, so the tee can never
-            // alter what the upstream receives (Req 7.3).
-            //
-            // Channel discipline (mirrors `tee_stream.rs`):
-            //   - `try_send` fast path: on `Ok`, the frame is queued, continue.
-            //   - `Full`: the bounded channel is at capacity, so switch to an awaited
-            //     `send` — the one place the cache can briefly backpressure the upload
-            //     (a bounded wait gated by the channel capacity, Req 2.2). The channel
-            //     bounds the buffered bytes to its capacity; there is no unbounded
-            //     internal queue, so per-request streaming memory is one in-flight
-            //     frame plus the channel capacity (Req 2.3, 1.4).
-            //   - `Closed`: the background cache task is gone. Drop the tee (set it to
-            //     `None`) and keep forwarding to the upstream verbatim — a cache
-            //     failure must never fail an upload the upstream would accept
-            //     (Req 7.1, 7.3).
-            if let Some(sender) = tee.as_ref() {
-                let mut tee_gone = false;
-                match sender.try_send(data.clone()) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(frame)) => {
-                        tee_full_waits += 1;
-                        if sender.send(frame).await.is_err() {
+                // Tee entity bytes to the cache, applying the same bounded-channel
+                // discipline as `TeeStream` on the GET path. Only frames actually
+                // forwarded to the upstream are tee'd (a frame rejected by the cap
+                // check above returns before reaching here, so it is never tee'd).
+                // The tee gets the client entity, not HTTP chunk overhead, so the
+                // aws-chunked cache decoder still sees what the client sent
+                // (Req 7.3).
+                //
+                // Channel discipline (mirrors `tee_stream.rs`):
+                //   - `try_send` fast path: on `Ok`, the frame is queued, continue.
+                //   - `Full`: the bounded channel is at capacity, so switch to an awaited
+                //     `send` — the one place the cache can briefly backpressure the upload
+                //     (a bounded wait gated by the channel capacity, Req 2.2). The channel
+                //     bounds the buffered bytes to its capacity; there is no unbounded
+                //     internal queue, so per-request streaming memory is one in-flight
+                //     frame plus the channel capacity (Req 2.3, 1.4).
+                //   - `Closed`: the background cache task is gone. Drop the tee (set it to
+                //     `None`) and keep forwarding to the upstream — a cache
+                //     failure must never fail an upload the upstream would accept
+                //     (Req 7.1, 7.3).
+                if let Some(sender) = tee.as_ref() {
+                    let mut tee_gone = false;
+                    match sender.try_send(data) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(frame)) => {
+                            tee_full_waits += 1;
+                            if sender.send(frame).await.is_err() {
+                                debug!(
+                                    "Cache tee channel closed during backpressure, \
+                                     continuing to forward without caching"
+                                );
+                                tee_gone = true;
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
                             debug!(
-                                "Cache tee channel closed during backpressure, \
-                                 continuing to forward without caching"
+                                "Cache tee channel closed, continuing to forward without caching"
                             );
                             tee_gone = true;
                         }
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        debug!("Cache tee channel closed, continuing to forward without caching");
-                        tee_gone = true;
+                    if tee_gone {
+                        // Stop teeing for the remainder of this request; keep forwarding.
+                        tee = None;
                     }
                 }
-                if tee_gone {
-                    // Stop teeing for the remainder of this request; keep forwarding.
-                    tee = None;
+            }
+            Err(frame) => {
+                if is_http_chunked && http_chunked_trailers.is_none() {
+                    if let Ok(trailers) = frame.into_trailers() {
+                        http_chunked_trailers = Some(trailers);
+                    }
                 }
             }
         }
+    }
+
+    if is_http_chunked {
+        write_http_chunked_terminator(&mut stream, http_chunked_trailers.as_ref()).await?;
     }
 
     stream
@@ -930,6 +960,88 @@ where
 
     // Parse response (unchanged).
     parse_http_response(&response_bytes, method, path_and_query)
+}
+
+/// True when any `Transfer-Encoding` value lists hop-by-hop `chunked`.
+fn request_is_http_chunked(headers: &hyper::HeaderMap) -> bool {
+    headers.get_all("transfer-encoding").iter().any(|value| {
+        value.to_str().ok().is_some_and(|v| {
+            v.split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        })
+    })
+}
+
+/// `{len:x}\r\n` for one HTTP chunk. 16 hex digits plus CRLF fits any `usize`.
+fn encode_http_chunk_size_line(len: usize) -> ([u8; 18], usize) {
+    use std::io::Write;
+    let mut buf = [0u8; 18];
+    let n = {
+        let mut cursor = std::io::Cursor::new(&mut buf[..]);
+        write!(cursor, "{len:x}\r\n").expect("HTTP chunk size line fits in 18 bytes");
+        cursor.position() as usize
+    };
+    (buf, n)
+}
+
+fn encode_http_chunked_terminator(trailers: Option<&hyper::HeaderMap>) -> Vec<u8> {
+    let mut out = b"0\r\n".to_vec();
+    if let Some(trailers) = trailers {
+        for (name, value) in trailers {
+            out.extend_from_slice(name.as_str().as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+fn map_upstream_write(err: std::io::Error, what: &str) -> ProxyError {
+    ProxyError::HttpError(format!("Failed to write {what}: {err}"))
+}
+
+async fn write_http_chunked_data(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    data: &[u8],
+) -> Result<()> {
+    // A 0-size HTTP chunk is the last-chunk terminator; only
+    // `write_http_chunked_terminator` may emit that.
+    if data.is_empty() {
+        return Ok(());
+    }
+    let (size_line, n) = encode_http_chunk_size_line(data.len());
+    stream
+        .write_all(&size_line[..n])
+        .await
+        .map_err(|e| map_upstream_write(e, "HTTP chunk size"))?;
+    stream
+        .write_all(data)
+        .await
+        .map_err(|e| map_upstream_write(e, "HTTP chunk data"))?;
+    stream
+        .write_all(b"\r\n")
+        .await
+        .map_err(|e| map_upstream_write(e, "HTTP chunk CRLF"))
+}
+
+async fn write_http_chunked_terminator(
+    stream: &mut (impl AsyncWriteExt + Unpin),
+    trailers: Option<&hyper::HeaderMap>,
+) -> Result<()> {
+    let framed;
+    let bytes: &[u8] = match trailers {
+        Some(trailers) if !trailers.is_empty() => {
+            framed = encode_http_chunked_terminator(Some(trailers));
+            &framed
+        }
+        _ => b"0\r\n\r\n",
+    };
+    stream
+        .write_all(bytes)
+        .await
+        .map_err(|e| map_upstream_write(e, "HTTP chunked terminator"))
 }
 
 /// Compute the allocation capacity for a body the buffered path must retain.
@@ -2427,16 +2539,9 @@ mod tests {
         incoming_request_with_details("PUT", "/bucket/key?part=1", None, body).await
     }
 
-    /// Construct a real inbound request with a caller-selected method, target, and
-    /// Content-Type so streaming tests exercise the same `Incoming` body the proxy
-    /// receives from a client connection.
-    async fn incoming_request_with_details(
-        method: &str,
-        path_and_query: &str,
-        content_type: Option<&str>,
-        body: Vec<u8>,
-    ) -> (
-        Request<hyper::body::Incoming>,
+    async fn spawn_incoming_http1_server() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<Request<hyper::body::Incoming>>,
         tokio::sync::oneshot::Sender<()>,
     ) {
         use hyper::server::conn::http1;
@@ -2476,6 +2581,23 @@ mod tests {
                 .serve_connection(TokioIo::new(stream), service)
                 .await;
         });
+
+        (address, request_rx, done_tx)
+    }
+
+    /// Construct a real inbound request with a caller-selected method, target, and
+    /// Content-Type so streaming tests exercise the same `Incoming` body the proxy
+    /// receives from a client connection.
+    async fn incoming_request_with_details(
+        method: &str,
+        path_and_query: &str,
+        content_type: Option<&str>,
+        body: Vec<u8>,
+    ) -> (
+        Request<hyper::body::Incoming>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (address, request_rx, done_tx) = spawn_incoming_http1_server().await;
 
         let content_length = body.len();
         let method: hyper::Method = method.parse().expect("test HTTP method must be valid");
@@ -2628,6 +2750,405 @@ mod tests {
         let _ = sock.write_all(response.as_bytes()).await;
         let _ = sock.flush().await;
         body
+    }
+
+    /// Drive a real Hyper `Incoming` request whose body is HTTP-chunked.
+    /// Unlike [`incoming_request`], this does not set `Content-Length` — Hyper
+    /// Client `Full` would.
+    async fn incoming_chunked_request(
+        extra_headers: &[(&str, &str)],
+        http_chunks: &[&[u8]],
+    ) -> (
+        Request<hyper::body::Incoming>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::net::TcpStream,
+    ) {
+        let (address, request_rx, done_tx) = spawn_incoming_http1_server().await;
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut request = Vec::new();
+        request.extend_from_slice(b"PUT /bucket/key?partNumber=1&uploadId=test HTTP/1.1\r\n");
+        request.extend_from_slice(format!("host: {address}\r\n").as_bytes());
+        request.extend_from_slice(b"transfer-encoding: chunked\r\n");
+        for (name, value) in extra_headers {
+            request.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+        }
+        request.extend_from_slice(b"\r\n");
+        for chunk in http_chunks {
+            // A 0-size chunk is the last-chunk; skip empty payloads here.
+            if chunk.is_empty() {
+                continue;
+            }
+            let (size_line, n) = encode_http_chunk_size_line(chunk.len());
+            request.extend_from_slice(&size_line[..n]);
+            request.extend_from_slice(chunk);
+            request.extend_from_slice(b"\r\n");
+        }
+        request.extend_from_slice(b"0\r\n\r\n");
+        client.write_all(&request).await.unwrap();
+        client.flush().await.unwrap();
+
+        (request_rx.await.unwrap(), done_tx, client)
+    }
+
+    fn header_map_from_http1_head(header_block: &[u8]) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        let text = std::str::from_utf8(header_block).unwrap_or("");
+        for line in text.split("\r\n").skip(1) {
+            if line.is_empty() {
+                break;
+            }
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            let Ok(name) = name.trim().parse::<hyper::header::HeaderName>() else {
+                continue;
+            };
+            let Ok(value) = value.trim().parse::<hyper::header::HeaderValue>() else {
+                continue;
+            };
+            headers.append(name, value);
+        }
+        headers
+    }
+
+    /// HTTP-chunk decode that requires a last-chunk and trailer terminator.
+    /// Used as the upstream oracle so a missing `0\r\n\r\n` cannot pass.
+    fn decode_terminated_http_chunked_body(
+        chunked_data: &[u8],
+    ) -> std::result::Result<Bytes, ChunkedDecodeError> {
+        let config = ChunkedDecodeConfig::default();
+        let mut entity = Vec::new();
+        let mut pos = 0;
+        let mut saw_last_chunk = false;
+        while pos < chunked_data.len() {
+            let size_line_end = match find_crlf(&chunked_data[pos..]) {
+                Some(offset) => pos + offset,
+                None => return Err(ChunkedDecodeError::TruncatedBeforeTerminator),
+            };
+            let size_str = String::from_utf8_lossy(&chunked_data[pos..size_line_end]);
+            let size_token = size_str.trim().split(';').next().unwrap_or("").trim();
+            let chunk_size = usize::from_str_radix(size_token, 16)
+                .map_err(|_| ChunkedDecodeError::MalformedChunkSize(size_str.trim().to_string()))?;
+            pos = size_line_end + 2;
+            if chunk_size == 0 {
+                saw_last_chunk = true;
+                break;
+            }
+            if chunk_size > config.max_chunk_size {
+                return Err(ChunkedDecodeError::ChunkTooLarge {
+                    declared: chunk_size,
+                    max: config.max_chunk_size,
+                });
+            }
+            if entity.len() + chunk_size > config.max_total_decoded {
+                return Err(ChunkedDecodeError::BodyTooLarge {
+                    accumulated: entity.len() + chunk_size,
+                    max: config.max_total_decoded,
+                });
+            }
+            if pos + chunk_size > chunked_data.len() {
+                return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
+            }
+            entity.extend_from_slice(&chunked_data[pos..pos + chunk_size]);
+            pos += chunk_size;
+            if pos + 2 <= chunked_data.len() && &chunked_data[pos..pos + 2] == b"\r\n" {
+                pos += 2;
+            } else {
+                return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
+            }
+        }
+        if !saw_last_chunk {
+            return Err(ChunkedDecodeError::TruncatedBeforeTerminator);
+        }
+        if chunked_data[pos..].starts_with(b"\r\n")
+            || chunked_data[pos..]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+        {
+            Ok(Bytes::from(entity))
+        } else {
+            Err(ChunkedDecodeError::TruncatedBeforeTerminator)
+        }
+    }
+
+    struct CapturedChunkedUpstream {
+        entity: Vec<u8>,
+        raw_body: Vec<u8>,
+    }
+
+    /// Mock upstream for a chunked request: drain until a terminated HTTP-chunked
+    /// body is present, then respond 200.
+    async fn capture_upstream_http_entity(
+        listener: tokio::net::TcpListener,
+    ) -> CapturedChunkedUpstream {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                panic!(
+                    "upstream closed before a complete HTTP-chunked body; captured {} bytes",
+                    buf.len()
+                );
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            assert!(
+                request_is_http_chunked(&header_map_from_http1_head(&buf[..header_end])),
+                "upstream request must keep Transfer-Encoding: chunked; headers:\n{}",
+                String::from_utf8_lossy(&buf[..header_end])
+            );
+            match decode_terminated_http_chunked_body(&buf[header_end..]) {
+                Ok(entity) => {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    let _ = sock.flush().await;
+                    return CapturedChunkedUpstream {
+                        entity: entity.to_vec(),
+                        raw_body: buf[header_end..].to_vec(),
+                    };
+                }
+                Err(ChunkedDecodeError::TruncatedBeforeTerminator) => continue,
+                Err(error) => panic!(
+                    "upstream HTTP-chunk decode failed ({error:?}); body={:?}",
+                    &buf[header_end..]
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn request_is_http_chunked_detects_chunked_transfer_encoding() {
+        let mut headers = hyper::HeaderMap::new();
+        assert!(!request_is_http_chunked(&headers));
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        assert!(request_is_http_chunked(&headers));
+        headers.insert("transfer-encoding", "gzip, chunked".parse().unwrap());
+        assert!(request_is_http_chunked(&headers));
+        headers.clear();
+        headers.append("transfer-encoding", "gzip".parse().unwrap());
+        headers.append("transfer-encoding", "chunked".parse().unwrap());
+        assert!(request_is_http_chunked(&headers));
+        headers.clear();
+        headers.insert("transfer-encoding", "gzip".parse().unwrap());
+        assert!(!request_is_http_chunked(&headers));
+    }
+
+    #[test]
+    fn encode_http_chunk_size_line_matches_lowercase_hex() {
+        for len in [1usize, 10, 0x10, 10 * 1024 * 1024, usize::MAX] {
+            let (buf, n) = encode_http_chunk_size_line(len);
+            assert_eq!(&buf[..n], format!("{len:x}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn encode_http_chunked_terminator_writes_last_chunk_and_optional_trailers() {
+        assert_eq!(encode_http_chunked_terminator(None), b"0\r\n\r\n");
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert("x-amz-checksum-crc64nvme", "abcd".parse().unwrap());
+        assert_eq!(
+            encode_http_chunked_terminator(Some(&trailers)),
+            b"0\r\nx-amz-checksum-crc64nvme: abcd\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn decode_terminated_http_chunked_body_requires_last_chunk() {
+        assert_eq!(
+            decode_terminated_http_chunked_body(b""),
+            Err(ChunkedDecodeError::TruncatedBeforeTerminator)
+        );
+        assert_eq!(
+            decode_terminated_http_chunked_body(b"5\r\nHello\r\n"),
+            Err(ChunkedDecodeError::TruncatedBeforeTerminator)
+        );
+        assert_eq!(
+            decode_terminated_http_chunked_body(b"5\r\nHello\r\n0\r\n"),
+            Err(ChunkedDecodeError::TruncatedBeforeTerminator)
+        );
+        assert_eq!(
+            decode_terminated_http_chunked_body(b"5\r\nHello\r\n0\r\n\r\n"),
+            Ok(Bytes::from_static(b"Hello"))
+        );
+        assert_eq!(
+            decode_terminated_http_chunked_body(b"0\r\n\r\n"),
+            Ok(Bytes::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_forward_reframes_http_chunked_aws_chunked_upload_part() {
+        // PyArrow / AWS CRT send UploadPart as HTTP `Transfer-Encoding: chunked`
+        // wrapping an aws-chunked entity. Hyper delivers entity data frames; the
+        // upstream must still receive a terminated HTTP-chunked body whose entity
+        // is those same aws-chunked bytes. The cache tee must see that entity,
+        // not HTTP chunk overhead.
+        let payload = b"hello world from pyarrow upload part";
+        let entity = crate::aws_chunked_decoder::encode_aws_chunked_with_trailers(
+            payload,
+            8,
+            &[("x-amz-checksum-crc64nvme", "abcd")],
+        );
+        let mid = entity.len() / 2;
+        let decoded_len = payload.len().to_string();
+        let extra_headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-decoded-content-length", decoded_len.as_str()),
+            ("x-amz-trailer", "x-amz-checksum-crc64nvme"),
+        ];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_http_entity(listener));
+        let (request, _connection_keepalive, _client) =
+            incoming_chunked_request(&extra_headers, &[&entity[..mid], &entity[mid..]]).await;
+
+        assert!(
+            request_is_http_chunked(request.headers()),
+            "Hyper Incoming must retain Transfer-Encoding: chunked; headers={:?}",
+            request.headers()
+        );
+
+        let (tee_tx, mut tee_rx) = mpsc::channel::<Bytes>(8);
+        let collector = tokio::spawn(async move {
+            let mut teed = Vec::new();
+            while let Some(chunk) = tee_rx.recv().await {
+                teed.extend_from_slice(&chunk);
+            }
+            teed
+        });
+
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let (parts, body) = request.into_parts();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            forward_signed_request_streaming(
+                &parts.method,
+                &parts.uri,
+                &parts.headers,
+                parts.version,
+                body,
+                "example.com",
+                &transport,
+                None,
+                entity.len() as u64,
+                Some(tee_tx),
+            ),
+        )
+        .await
+        .expect("chunked UploadPart re-framing must not stall")
+        .expect("chunked UploadPart re-framing must succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = upstream.await.unwrap();
+        assert_eq!(
+            captured.entity, entity,
+            "upstream HTTP-unchunked body must be the original aws-chunked entity"
+        );
+        assert_eq!(
+            collector.await.unwrap(),
+            entity,
+            "cache tee must receive entity bytes, not HTTP chunk framing"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_forward_terminates_empty_http_chunked_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_http_entity(listener));
+        let (request, _connection_keepalive, _client) = incoming_chunked_request(&[], &[]).await;
+
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let (parts, body) = request.into_parts();
+        let response = forward_signed_request_streaming(
+            &parts.method,
+            &parts.uri,
+            &parts.headers,
+            parts.version,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await
+        .expect("empty chunked body must forward");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = upstream.await.unwrap();
+        assert_eq!(captured.entity, b"");
+        assert_eq!(captured.raw_body, b"0\r\n\r\n");
+    }
+
+    #[tokio::test]
+    async fn streaming_forward_writes_http_trailers_after_last_chunk() {
+        use futures::stream;
+        use http_body_util::StreamBody;
+        use hyper::body::Frame;
+
+        let entity = Bytes::from_static(b"hello");
+        let mut trailers = hyper::HeaderMap::new();
+        trailers.insert("x-amz-checksum-crc64nvme", "abcd".parse().unwrap());
+        let stream_frames: Vec<std::result::Result<Frame<Bytes>, std::io::Error>> = vec![
+            Ok(Frame::data(entity.clone())),
+            Ok(Frame::trailers(trailers)),
+        ];
+        let body = StreamBody::new(stream::iter(stream_frames));
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(capture_upstream_http_entity(listener));
+        let transport = UpstreamTransport {
+            ip: address.ip(),
+            port: address.port(),
+            tls: None,
+            validated_endpoint: None,
+        };
+        let response = forward_signed_request_streaming(
+            &hyper::Method::PUT,
+            &"/bucket/key".parse().unwrap(),
+            &headers,
+            hyper::Version::HTTP_11,
+            body,
+            "example.com",
+            &transport,
+            None,
+            u64::MAX,
+            None,
+        )
+        .await
+        .expect("chunked body with HTTP trailers must forward");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captured = upstream.await.unwrap();
+        assert_eq!(captured.entity, b"hello");
+        assert_eq!(
+            captured.raw_body,
+            b"5\r\nhello\r\n0\r\nx-amz-checksum-crc64nvme: abcd\r\n\r\n"
+        );
     }
 
     #[tokio::test]
