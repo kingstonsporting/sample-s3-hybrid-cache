@@ -38,7 +38,7 @@ lz4_flex = "0.11.6"
 # (see compression-content-aware-fix spec) to hand-roll a valid LZ4 frame with
 # uncompressed blocks — avoiding the LZ4 compressor entirely while still
 # producing a checksummed frame that lz4_flex::frame::FrameDecoder can read.
-twox-hash = "2.1.2"
+twox-hash = "2.1.5"
 
 # Hashing
 blake3 = "1.5"

@@ -698,6 +698,14 @@ pub struct HttpProxy {
     inflight_ledger: Arc<crate::inflight_ledger::InflightLedger>,
 }
 
+/// A page's bytes and the object version they belong to.
+struct FilledPage {
+    data: Bytes,
+    etag: String,
+    /// The object's size, when a response reported it.
+    object_size: Option<u64>,
+}
+
 impl HttpProxy {
     /// Create a new HTTP proxy instance
     pub fn new(listen_addr: SocketAddr, config: Arc<Config>) -> Result<Self> {
@@ -3527,10 +3535,12 @@ impl HttpProxy {
                                     range_handler,
                                     s3_client,
                                     &host,
-                                    uri.path(),
+                                    uri.path_and_query()
+                                        .map_or(uri.path(), |value| value.as_str()),
                                     &header_map_for_serve,
                                     config,
                                     &resolved_settings,
+                                    permit,
                                 )
                                 .await;
                             }
@@ -3887,14 +3897,18 @@ impl HttpProxy {
                                                         range_handler,
                                                         s3_client,
                                                         &host,
-                                                        uri.path(),
+                                                        uri.path_and_query()
+                                                            .map_or(uri.path(), |value| {
+                                                                value.as_str()
+                                                            }),
                                                         &header_map,
                                                         config,
                                                         &resolved_settings,
+                                                        permit,
                                                     )
                                                     .await;
                                                 } else if response.status == StatusCode::OK {
-                                                    // 200 OK - data changed, remove stale range and forward to S3 (Requirement 2.4)
+                                                    // 200 OK - data changed: drop the old coverage and serve the new object (Requirement 2.4)
                                                     debug!(
                                                     "Full object conditional validation returned 200 OK, data changed: cache_key={}, range={}-{}",
                                                     cache_key, cached_range.start, cached_range.end
@@ -3908,15 +3922,8 @@ impl HttpProxy {
                                                     // removing only the first leaves
                                                     // superseded bytes on disk under a
                                                     // `.meta` that still references
-                                                    // them. This path then falls
-                                                    // through to a forward rather than
-                                                    // to a cache-serving helper, so the
-                                                    // consequence here is a stale
-                                                    // remnant rather than an immediate
-                                                    // stale serve — but the remnant is
-                                                    // reachable by the next request,
-                                                    // which is exactly what was
-                                                    // measured on the range path. See
+                                                    // them, reachable by the next
+                                                    // request. See
                                                     // `tests/changed_range_revalidation_stale_serve_test.rs`.
                                                     if let Err(e) = cache_manager
                                                         .invalidate_cache_hierarchy(&cache_key)
@@ -3937,8 +3944,7 @@ impl HttpProxy {
                                                         );
                                                     }
 
-                                                    if let Some(g) = fetcher_guard.take() {
-                                                        g.complete_success();
+                                                    if fetcher_guard.is_some() {
                                                         if let Some(ref mm) = metrics_manager {
                                                             mm.read()
                                                                 .await
@@ -3947,7 +3953,25 @@ impl HttpProxy {
                                                         }
                                                     }
 
-                                                    // Fall through to forward_get_head_with_coordination
+                                                    // The 200 already carries the changed
+                                                    // object, so answer with it and cache it
+                                                    // rather than fetching it again.
+                                                    return Self::respond_with_object_and_cache(
+                                                        response,
+                                                        Instant::now(),
+                                                        method,
+                                                        uri,
+                                                        header_map,
+                                                        cache_key,
+                                                        cache_manager,
+                                                        s3_client,
+                                                        range_handler,
+                                                        config,
+                                                        &resolved_settings,
+                                                        fetcher_guard.take(),
+                                                        permit,
+                                                    )
+                                                    .await;
                                                 } else if response.status == StatusCode::FORBIDDEN
                                                     || response.status == StatusCode::UNAUTHORIZED
                                                 {
@@ -4078,10 +4102,12 @@ impl HttpProxy {
                                             range_handler,
                                             s3_client,
                                             &host,
-                                            uri.path(),
+                                            uri.path_and_query()
+                                                .map_or(uri.path(), |value| value.as_str()),
                                             &header_map,
                                             config,
                                             &resolved_settings,
+                                            permit,
                                         )
                                         .await;
                                     }
@@ -4123,10 +4149,12 @@ impl HttpProxy {
                                     range_handler,
                                     s3_client,
                                     &host,
-                                    uri.path(),
+                                    uri.path_and_query()
+                                        .map_or(uri.path(), |value| value.as_str()),
                                     &header_map,
                                     config,
                                     &resolved_settings,
+                                    permit,
                                 )
                                 .await;
                             }
@@ -5239,7 +5267,17 @@ impl HttpProxy {
         // re-resolving (Requirement 8.2). The effective compression decision
         // additionally folds in the size threshold and the built-in extension
         // denylist (rules-win — see `CacheManager::effective_compression`).
-        let range_size = range_spec.end.saturating_sub(range_spec.start) + 1;
+        // Cache the extent the response carries. `range_spec` was resolved against
+        // the cached object size, which a suffix or open-ended request gets wrong
+        // once the object has changed size.
+        let cached_extent = Self::response_extent(&s3_response);
+        if cached_extent.is_some_and(|extent| extent != (range_spec.start, range_spec.end)) {
+            debug!(
+                "Response extent differs from the resolved request: cache_key={}, requested={}-{}, response={:?}",
+                cache_key, range_spec.start, range_spec.end, cached_extent
+            );
+        }
+        let range_size = cached_extent.map_or(0, |(start, end)| end - start + 1);
         let compression_enabled = range_handler
             .get_cache_manager()
             .effective_compression(resolved, &cache_key, range_size);
@@ -5267,8 +5305,8 @@ impl HttpProxy {
         }
 
         // Handle body with tee streaming for caching
-        let body = match s3_response.body {
-            Some(S3ResponseBody::Streaming(incoming)) => {
+        let body = match (s3_response.body, cached_extent) {
+            (Some(S3ResponseBody::Streaming(incoming)), Some((start, end))) => {
                 // Create channel for cache data
                 let (cache_tx, cache_rx) = mpsc::channel::<Bytes>(100);
 
@@ -5285,8 +5323,6 @@ impl HttpProxy {
 
                 // Spawn background task to incrementally write cache data as chunks arrive
                 let cache_key_clone = cache_key.clone();
-                let start = range_spec.start;
-                let end = range_spec.end;
                 let s3_client_clone = s3_client.clone();
                 let disk_cache = Arc::clone(range_handler.get_disk_cache_manager());
                 let cache_manager = Arc::clone(range_handler.get_cache_manager());
@@ -5435,8 +5471,8 @@ impl HttpProxy {
                 // Bucket is extracted from cache_key; no request UA available here so
                 // caller-id always falls back to bucket fairness on the range path.
                 let range_bucket = cache_key.split('/').next();
-                // known_len from the range spec: we know exactly how many bytes this range contains.
-                let range_known_len = Some(range_spec.end - range_spec.start + 1);
+                // known_len from the response's extent: exactly the bytes it carries.
+                let range_known_len = Some(range_size);
                 let throttled = wrap_origin_stream(
                     tee_stream,
                     &std::collections::HashMap::new(), // no request headers on range path
@@ -5447,7 +5483,11 @@ impl HttpProxy {
                 // Convert to BoxBody - StreamBody already implements Body
                 crate::permit_body::PermitBody::new(StreamBody::new(throttled), permit).boxed()
             }
-            Some(S3ResponseBody::Buffered(bytes)) => {
+            // No extent to cache under: pass the body through untouched.
+            (Some(S3ResponseBody::Streaming(incoming)), None) => {
+                crate::permit_body::PermitBody::new(incoming, permit).boxed()
+            }
+            (Some(S3ResponseBody::Buffered(bytes)), _) => {
                 // Already buffered, just return it
                 crate::permit_body::PermitBody::new(
                     Full::new(bytes).map_err(|never| match never {}),
@@ -5455,7 +5495,7 @@ impl HttpProxy {
                 )
                 .boxed()
             }
-            None => crate::permit_body::PermitBody::new(
+            (None, _) => crate::permit_body::PermitBody::new(
                 Full::new(Bytes::new()).map_err(|never| match never {}),
                 permit,
             )
@@ -5463,6 +5503,27 @@ impl HttpProxy {
         };
 
         Ok(response_builder.body(body).unwrap())
+    }
+
+    /// The object byte range a 200 or 206 response actually carries.
+    fn response_extent(response: &crate::s3_client::S3Response) -> Option<(u64, u64)> {
+        let header = |name: &str| {
+            response
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        match response.status {
+            StatusCode::PARTIAL_CONTENT => header("content-range")
+                .and_then(parse_content_range)
+                .map(|(start, end, _)| (start, end)),
+            StatusCode::OK => header("content-length")
+                .and_then(|length| length.parse::<u64>().ok())
+                .filter(|length| *length > 0)
+                .map(|length| (0, length - 1)),
+            _ => None,
+        }
     }
 
     /// Page-aligned range widening eligibility gate + orchestration
@@ -5635,6 +5696,7 @@ impl HttpProxy {
                         &pages,
                         client_headers,
                         current_etag,
+                        content_length,
                         cache_manager,
                         range_handler,
                         s3_client,
@@ -5984,6 +6046,7 @@ impl HttpProxy {
         pages: &[(u64, u64)],
         client_headers: &HashMap<String, String>,
         current_etag: Option<&str>,
+        resolved_size: Option<u64>,
         cache_manager: &Arc<CacheManager>,
         range_handler: &Arc<RangeHandler>,
         s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
@@ -6036,11 +6099,11 @@ impl HttpProxy {
                 max_inflight_fraction,
             )
         });
-        let page_results: Vec<Result<Bytes>> = futures::future::join_all(page_futures).await;
+        let page_results: Vec<Result<FilledPage>> = futures::future::join_all(page_futures).await;
 
         // If any Page failed, fall back to the client's original (un-widened)
         // range: retry once and skip page caching for this request (Requirement 5).
-        let mut page_bytes: Vec<Bytes> = Vec::with_capacity(page_results.len());
+        let mut page_bytes: Vec<FilledPage> = Vec::with_capacity(page_results.len());
         for result in page_results {
             match result {
                 Ok(bytes) => page_bytes.push(bytes),
@@ -6052,9 +6115,8 @@ impl HttpProxy {
                     if let Some(ref mm) = metrics_manager {
                         mm.read().await.record_page_fallback().await;
                     }
-                    return Self::fallback_original_absolute_range(
+                    return Self::fallback_original_range(
                         cache_key,
-                        original_range,
                         client_headers,
                         s3_client,
                         host,
@@ -6070,10 +6132,41 @@ impl HttpProxy {
         // Pages are contiguous and sorted by start (1 or 2). Concatenate to
         // form the widened target buffer, then slice the client's original
         // sub-range from it.
+        // Pages are filled independently, so one response may only be built from
+        // pages of a single object version, sized as the request was resolved,
+        // and described by that version's metadata.
+        let etag = page_bytes[0].etag.clone();
+        let one_version = !etag.is_empty()
+            && page_bytes.iter().all(|page| page.etag == etag)
+            && current_etag.is_none_or(|current| current == etag)
+            && page_bytes
+                .iter()
+                .filter_map(|page| page.object_size)
+                .all(|size| resolved_size.is_none_or(|resolved| resolved == size));
+        let cached_metadata = Self::resolve_cached_metadata(None, cache_manager, cache_key).await;
+        if !one_version || cached_metadata.etag != etag {
+            debug!(
+                "[page-widening] pages span object versions, forwarding the original range: cache_key={}, range={}-{}",
+                cache_key, original_range.start, original_range.end
+            );
+            if let Some(ref mm) = metrics_manager {
+                mm.read().await.record_page_fallback().await;
+            }
+            return Self::fallback_original_range(
+                cache_key,
+                client_headers,
+                s3_client,
+                host,
+                uri,
+                proxy_referer,
+                permit,
+            )
+            .await;
+        }
         let target_start = pages[0].0;
         let mut widened_data = Vec::new();
-        for buf in &page_bytes {
-            widened_data.extend_from_slice(buf);
+        for page in &page_bytes {
+            widened_data.extend_from_slice(&page.data);
         }
 
         let slice_start = (original_range.start - target_start) as usize;
@@ -6086,9 +6179,8 @@ impl HttpProxy {
             if let Some(ref mm) = metrics_manager {
                 mm.read().await.record_page_fallback().await;
             }
-            return Self::fallback_original_absolute_range(
+            return Self::fallback_original_range(
                 cache_key,
-                original_range,
                 client_headers,
                 s3_client,
                 host,
@@ -6100,12 +6192,6 @@ impl HttpProxy {
         }
         let sliced = widened_data[slice_start..slice_start + slice_len].to_vec();
 
-        // Resolve headers (ETag / Last-Modified / total size) from the now
-        // (asynchronously) cached metadata, falling back to whatever the
-        // fetch populated in cache_manager's in-memory metadata cache. If not
-        // yet visible, fall back to a minimal header set — the client still
-        // gets exactly the requested bytes.
-        let cached_metadata = Self::resolve_cached_metadata(None, cache_manager, cache_key).await;
         let total_object_size = if cached_metadata.content_length > 0 {
             cached_metadata.content_length
         } else {
@@ -6166,7 +6252,7 @@ impl HttpProxy {
         wait_timeout: std::time::Duration,
         hedge_budget: Option<&Arc<AtomicUsize>>,
         max_inflight_fraction: f64,
-    ) -> Result<Bytes> {
+    ) -> Result<FilledPage> {
         let page_range = RangeSpec {
             start: page_start,
             end: page_end,
@@ -6194,9 +6280,11 @@ impl HttpProxy {
         // via `ShardedRamCache::get`'s existing access tracking, counts as a
         // Page access — Requirement 7.4 — with no additional code here).
         if !has_range_conditional {
-            if let Some(ram_data) =
-                cache_manager.get_range_from_ram_cache(cache_key, page_start, page_end)
-            {
+            if let Some((ram_data, etag)) = current_etag.and_then(|etag| {
+                cache_manager
+                    .get_range_from_ram_cache(cache_key, page_start, page_end, etag)
+                    .map(|data| (data, etag))
+            }) {
                 debug!(
                     "[page-widening] RAM page hit: cache_key={}, page={}-{}",
                     cache_key, page_start, page_end
@@ -6204,7 +6292,11 @@ impl HttpProxy {
                 if let Some(ref mm) = metrics_manager {
                     mm.read().await.record_page_hit().await;
                 }
-                return Ok(ram_data);
+                return Ok(FilledPage {
+                    data: ram_data,
+                    etag: etag.to_string(),
+                    object_size: None,
+                });
             }
         }
 
@@ -6368,7 +6460,7 @@ impl HttpProxy {
         proxy_referer: &Option<String>,
         hedge_budget: Option<&Arc<AtomicUsize>>,
         max_inflight_fraction: f64,
-    ) -> Result<Bytes> {
+    ) -> Result<FilledPage> {
         let mut headers = client_headers.clone();
         // Conditional headers (If-Range / If-Match / If-None-Match) are forwarded
         // as-is (Requirement 2.6). Strip only the client's Range — we set our
@@ -6434,6 +6526,36 @@ impl HttpProxy {
         // Assemble the Page's contiguous buffer from cached segments plus the
         // just-fetched segments — in memory, not via a disk re-read (which
         // could race the metadata write just performed above).
+        // Every segment of the page must come from one object version: the
+        // cached parts and each fetched part were obtained at different times.
+        let header = |headers: &HashMap<String, String>, name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        };
+        let mut etags = overlap
+            .cached_ranges
+            .iter()
+            .map(|range| range.etag.clone())
+            .chain(
+                fetched_ranges
+                    .iter()
+                    .map(|(_, _, headers)| header(headers, "etag").unwrap_or_default()),
+            );
+        let etag = etags.next().unwrap_or_default();
+        if etag.is_empty() || etags.any(|other| other != etag) {
+            return Err(ProxyError::CacheVersionMismatch {
+                cache_key: cache_key.to_string(),
+                cached_etag: etag,
+                response_etag: String::new(),
+            });
+        }
+        let object_size = fetched_ranges.first().and_then(|(_, _, headers)| {
+            header(headers, "content-range")
+                .and_then(|value| parse_content_range(&value))
+                .map(|(_, _, total)| total)
+        });
         let fetched_as_ranges: Vec<(RangeSpec, Bytes, HashMap<String, String>)> =
             fetched_ranges.into_iter().collect();
         let merge_result = range_handler
@@ -6454,7 +6576,11 @@ impl HttpProxy {
         // a single small (e.g. 4 KiB footer) read pin a whole Page (up to
         // 16 MiB default) in RAM on its very first access.
 
-        Ok(merge_result.data)
+        Ok(FilledPage {
+            data: merge_result.data,
+            etag,
+            object_size,
+        })
     }
 
     /// Look up a Page's cache overlap, falling back to the shared-storage
@@ -6469,19 +6595,14 @@ impl HttpProxy {
     /// write with no prior `.meta` file, so a second read landing in the
     /// journal-not-yet-consolidated window must check the journal directly to
     /// see the Page as cached rather than re-fetching from S3 (Requirement 6.1
-    /// — page hits with no S3 fetch).
+    /// - page hits with no S3 fetch).
     ///
     /// **Requirement 7.6 (RAM-disk coherency / ETag mismatch invalidation)**:
     /// the metadata-backed path is `range_handler.find_cached_ranges`, which
     /// already performs the ETag comparison and calls
-    /// `disk_cache.invalidate_all_ranges` on mismatch — traced directly above
-    /// in `find_cached_ranges` (`range_handler.rs`), not merely inferred. This
-    /// Page path therefore inherits that check for free through the shared
-    /// call; no separate Page-specific ETag check is needed on the
-    /// metadata-backed branch. The journal fallback branch below has no ETag
-    /// to compare (see its own comment) and is handled instead by refusing
-    /// RAM promotion when the ETag is unknown (Requirement 7.6's RAM-tier
-    /// half, enforced in `load_page_from_cache`).
+    /// `disk_cache.invalidate_all_ranges` on mismatch. The journal fallback
+    /// accepts only entries whose originating ETag matches `current_etag`;
+    /// when `current_etag` is `None`, it returns no cached ranges.
     async fn find_page_overlap(
         cache_key: &str,
         page_range: &RangeSpec,
@@ -6510,11 +6631,11 @@ impl HttpProxy {
             return Ok(overlap);
         }
 
-        // No metadata-backed overlap — check the journal directly for a
+        // No metadata-backed overlap - check the journal directly for a
         // not-yet-consolidated write of this exact Page.
         let disk_cache = range_handler.get_disk_cache_manager().read().await;
         let journal_ranges = disk_cache
-            .find_pending_journal_ranges(cache_key, page_range.start, page_range.end)
+            .find_pending_journal_ranges(cache_key, page_range.start, page_range.end, current_etag)
             .await?;
         drop(disk_cache);
 
@@ -6522,15 +6643,9 @@ impl HttpProxy {
             return Ok(overlap);
         }
 
-        // The journal has no per-entry ETag/Last-Modified (only start/end/
-        // compression), so the only real ETag available here is whatever the
-        // caller already knows (`current_etag`, from a prior HEAD/GET
-        // response). When that is `None` these ranges carry an empty ETag —
-        // `load_page_from_cache` treats an empty ETag as "unknown" and skips
-        // RAM promotion for it (Requirement 7.6), rather than promoting with
-        // a placeholder that would silently defeat the ETag-keyed RAM-disk
-        // coherency check. `last_modified` is never known from the journal
-        // and is likewise left empty.
+        // Journal lookup verified these ranges against the caller's ETag.
+        // It returns range specs without object headers, so Last-Modified
+        // remains unknown here.
         let cached_ranges: Vec<crate::cache::Range> = journal_ranges
             .iter()
             .map(|r| crate::cache::Range {
@@ -6617,7 +6732,7 @@ impl HttpProxy {
         cache_manager: &Arc<CacheManager>,
         resolved: &crate::bucket_settings::ResolvedSettings,
         metrics_manager: &Option<Arc<tokio::sync::RwLock<crate::metrics::MetricsManager>>>,
-    ) -> Result<Bytes> {
+    ) -> Result<FilledPage> {
         let merge_result = range_handler
             .merge_range_segments(cache_key, page_range, &overlap.cached_ranges, &[])
             .await
@@ -6658,7 +6773,15 @@ impl HttpProxy {
             );
         }
 
-        Ok(merge_result.data)
+        Ok(FilledPage {
+            data: merge_result.data,
+            etag: overlap
+                .cached_ranges
+                .first()
+                .map(|range| range.etag.clone())
+                .unwrap_or_default(),
+            object_size: None,
+        })
     }
 
     /// Promote a fully-assembled Page buffer to the RAM cache as a single
@@ -6748,13 +6871,12 @@ impl HttpProxy {
         });
     }
 
-    /// Failure fallback (Requirement 5): retry the client's ORIGINAL absolute
-    /// range, unwidened, and serve it directly without attempting to cache the
-    /// page again.
+    /// Failure fallback (Requirement 5): retry the client's ORIGINAL range,
+    /// unwidened, and serve it directly without attempting to cache the page
+    /// again.
     #[allow(clippy::too_many_arguments)]
-    async fn fallback_original_absolute_range(
+    async fn fallback_original_range(
         cache_key: &str,
-        original_range: &RangeSpec,
         client_headers: &HashMap<String, String>,
         s3_client: &Arc<dyn S3ClientApi + Send + Sync>,
         host: &str,
@@ -6762,12 +6884,9 @@ impl HttpProxy {
         proxy_referer: &Option<String>,
         permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
+        // The client's own Range: S3 resolves a suffix or open-ended form against
+        // the object as it is now, which `original_range` may not match.
         let mut headers = client_headers.clone();
-        headers.retain(|k, _| k.to_lowercase() != "range");
-        headers.insert(
-            "Range".to_string(),
-            format!("bytes={}-{}", original_range.start, original_range.end),
-        );
         let auth_header_owned: Option<String> = headers
             .get("authorization")
             .or_else(|| headers.get("Authorization"))
@@ -7698,8 +7817,7 @@ impl HttpProxy {
                                                     );
                                                 }
 
-                                                if let Some(g) = fetcher_guard.take() {
-                                                    g.complete_success();
+                                                if fetcher_guard.is_some() {
                                                     if let Some(ref mm) = metrics_manager {
                                                         mm.read()
                                                             .await
@@ -7708,53 +7826,22 @@ impl HttpProxy {
                                                     }
                                                 }
 
-                                                // DESIGN DEVIATION, recorded per
-                                                // `design.md` § "Handle changed 200
-                                                // and 206": the fresh response has
-                                                // already been received, and the ideal
-                                                // is to push it through the normal
-                                                // response/caching pipeline. There is
-                                                // no helper that accepts an
-                                                // already-received `S3Response` for a
-                                                // range and both returns and caches
-                                                // it, so this re-fetches against an
-                                                // all-missing overlap instead. Cost:
-                                                // one extra upstream request in the
-                                                // changed case only. Serving the old
-                                                // overlap is not an option, and the
-                                                // design names this as the sanctioned
-                                                // fallback.
-                                                //
-                                                // `all_missing` is what makes the
-                                                // helper's `missing_ranges.is_empty()`
-                                                // short-circuit unreachable — the fix
-                                                // does not depend on the invalidation
-                                                // above having deleted every file.
-                                                // Two independent guards, because the
-                                                // single-extent case showed how easily
-                                                // one of them holds by accident.
-                                                return Self::forward_range_request_to_s3(
-                                                    method,
-                                                    uri.clone(),
-                                                    host.clone(),
-                                                    client_headers.clone(),
+                                                // The response S3 just sent answers the
+                                                // client's own request for the current
+                                                // version, so serve it and cache it by
+                                                // its Content-Range instead of fetching
+                                                // the same bytes again. Waiters on this
+                                                // flight are released once the new range
+                                                // is committed.
+                                                return Self::convert_s3_response_to_http_with_caching(
+                                                    response,
                                                     cache_key.clone(),
                                                     range_spec.clone(),
-                                                    crate::range_handler::RangeOverlap::all_missing(
-                                                        &range_spec,
-                                                    ),
-                                                    cache_manager,
                                                     range_handler.clone(),
                                                     s3_client,
                                                     config.clone(),
-                                                    // The old metadata describes the
-                                                    // superseded version and has just
-                                                    // been invalidated; passing it on
-                                                    // would reintroduce it.
-                                                    None,
                                                     resolved,
-                                                    proxy_referer,
-                                                    None,
+                                                    fetcher_guard.take(),
                                                     permit.clone(),
                                                 )
                                                 .await;
@@ -8210,6 +8297,7 @@ impl HttpProxy {
         headers: &HeaderMap,
         config: Arc<Config>,
         resolved: &crate::bucket_settings::ResolvedSettings,
+        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         // Admission_Check before buffering: this path buffers the whole
         // object into memory (`load_range_data_with_cache` allocates
@@ -8220,7 +8308,7 @@ impl HttpProxy {
         // design's line-numbered table. Requirements: IMA 1.2, 1.3, 2.1, 2.5.
         let full_object_bytes = range_spec.end - range_spec.start + 1;
         let ledger = s3_client.get_inflight_ledger();
-        let mut full_object_reservation = match ledger.try_reserve(full_object_bytes) {
+        let full_object_reservation = match ledger.try_reserve(full_object_bytes) {
             Some(r) => r,
             None => {
                 return Ok(Self::proxy_error_to_response(
@@ -8236,18 +8324,19 @@ impl HttpProxy {
         let perf_start = Instant::now();
         let data_load_start = Instant::now();
         let (range_data, _merge_metrics, is_ram_hit) = match Self::get_cached_range_data(
+            &method,
             range_spec,
             overlap,
             cache_key,
             &cache_manager,
             &range_handler,
-            s3_client,
+            Arc::clone(&s3_client),
             host,
             uri,
             headers,
             &config,
             resolved,
-            Some(&mut full_object_reservation),
+            permit.clone(),
         )
         .await
         {
@@ -8264,6 +8353,28 @@ impl HttpProxy {
                 crate::cache_types::ObjectMetadata::default()
             }
         };
+
+        if overlap
+            .cached_ranges
+            .iter()
+            .any(|range| range.etag != cached_metadata.etag)
+        {
+            return Ok(Self::forward_original_range_request(
+                &method,
+                cache_key,
+                range_spec,
+                &cache_manager,
+                &range_handler,
+                s3_client,
+                host,
+                uri,
+                headers,
+                &config,
+                resolved,
+                permit.clone(),
+            )
+            .await);
+        }
 
         // Build 200 OK response (not 206 Partial Content)
         let mut response_builder = Response::builder()
@@ -8332,7 +8443,7 @@ impl HttpProxy {
         };
         let body = crate::permit_body::PermitBody::new(
             crate::permit_body::ChunkedBytes::new(response_bytes).map_err(|never| match never {}),
-            None,
+            permit,
         )
         .with_reservation(full_object_reservation)
         .boxed();
@@ -8351,7 +8462,7 @@ impl HttpProxy {
             let total_ms = perf_start.elapsed().as_millis();
             debug!(
                 "PERF cache_hit path={} range={}-{} size={} data_load_ms={} total_ms={} source=disk_buffered",
-                uri, range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
+                mask_presigned_params(uri), range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
             );
         }
 
@@ -8395,7 +8506,9 @@ impl HttpProxy {
         // Log cache hit at debug level for observability
         debug!(
             "GET part cache HIT for {} range {}-{}",
-            uri, cached_part.start, cached_part.end
+            mask_presigned_params(uri),
+            cached_part.start,
+            cached_part.end
         );
 
         Ok(response)
@@ -8431,9 +8544,14 @@ impl HttpProxy {
         // Check RAM cache before the streaming/buffered decision (Requirements 3.1, 3.2, 3.3, 4.1, 4.2)
         let perf_start = Instant::now();
         let ram_lookup_start = Instant::now();
-        if let Some(ram_data) =
-            cache_manager.get_range_from_ram_cache(cache_key, range_spec.start, range_spec.end)
-        {
+        if let Some(ram_data) = overlap.cached_ranges.first().and_then(|cached| {
+            cache_manager.get_range_from_ram_cache(
+                cache_key,
+                range_spec.start,
+                range_spec.end,
+                &cached.etag,
+            )
+        }) {
             let ram_lookup_ms = ram_lookup_start.elapsed().as_millis();
             debug!(
                 "RAM cache hit for range {}-{}, serving buffered response",
@@ -8486,14 +8604,16 @@ impl HttpProxy {
 
             debug!(
                 "GET RAM range cache HIT for {} range {}-{}",
-                uri, range_spec.start, range_spec.end
+                mask_presigned_params(uri),
+                range_spec.start,
+                range_spec.end
             );
 
             if method != Method::HEAD {
                 let total_ms = perf_start.elapsed().as_millis();
                 debug!(
                     "PERF cache_hit path={} range={}-{} size={} ram_lookup_ms={} total_ms={} source=ram",
-                    uri, range_spec.start, range_spec.end, ram_data_len, ram_lookup_ms, total_ms
+                    mask_presigned_params(uri), range_spec.start, range_spec.end, ram_data_len, ram_lookup_ms, total_ms
                 );
             }
 
@@ -8530,6 +8650,28 @@ impl HttpProxy {
                 Self::resolve_cached_metadata(preloaded_metadata, &cache_manager, cache_key).await;
             let metadata_ms = metadata_start.elapsed().as_millis();
 
+            if overlap
+                .cached_ranges
+                .iter()
+                .any(|range| range.etag != cached_metadata.etag)
+            {
+                return Ok(Self::forward_original_range_request(
+                    &method,
+                    cache_key,
+                    range_spec,
+                    &cache_manager,
+                    &range_handler,
+                    s3_client,
+                    host,
+                    uri,
+                    headers,
+                    &config,
+                    resolved,
+                    permit.clone(),
+                )
+                .await);
+            }
+
             let total_object_size = cached_metadata.content_length;
 
             // Build Content-Range and Content-Length from metadata before streaming (Requirement 5.6)
@@ -8563,10 +8705,15 @@ impl HttpProxy {
                     disk_cache.get_metadata(cache_key).await.ok().flatten()
                 };
 
+                let version_id = crate::disk_cache::object_version_id(&cached_range.etag);
                 metadata.and_then(|meta| {
                     meta.ranges
                         .iter()
-                        .find(|r| r.start == cached_range.start && r.end == cached_range.end)
+                        .find(|r| {
+                            r.start == cached_range.start
+                                && r.end == cached_range.end
+                                && crate::disk_cache::range_file_belongs_to(r, &version_id)
+                        })
                         .cloned()
                 })
             };
@@ -8580,6 +8727,7 @@ impl HttpProxy {
                             cache_key,
                             cached_range.start,
                             cached_range.end,
+                            Some(&cached_range.etag),
                         )
                         .await
                     {
@@ -8646,7 +8794,12 @@ impl HttpProxy {
             const DEFAULT_CHUNK_SIZE: usize = 1_048_576; // 1 MiB
             let disk_open_start = Instant::now();
             match disk_cache
-                .stream_range_data(&disk_range_spec, DEFAULT_CHUNK_SIZE)
+                .stream_range_data_for_version(
+                    &disk_range_spec,
+                    DEFAULT_CHUNK_SIZE,
+                    cache_key,
+                    &cached_range.etag,
+                )
                 .await
             {
                 Ok(data_stream) => {
@@ -8825,7 +8978,9 @@ impl HttpProxy {
 
                     debug!(
                         "GET Disk (streaming) range cache HIT for {} range {}-{}",
-                        uri, range_spec.start, range_spec.end
+                        mask_presigned_params(uri),
+                        range_spec.start,
+                        range_spec.end
                     );
 
                     {
@@ -8833,7 +8988,7 @@ impl HttpProxy {
                         let total_ms = perf_start.elapsed().as_millis();
                         debug!(
                             "PERF cache_hit path={} range={}-{} size={} metadata_ms={} disk_open_ms={} stream_setup_ms={} total_ms={} source=disk_streaming",
-                            uri, range_spec.start, range_spec.end, range_size, metadata_ms, disk_open_ms, stream_setup_ms, total_ms
+                            mask_presigned_params(uri), range_spec.start, range_spec.end, range_size, metadata_ms, disk_open_ms, stream_setup_ms, total_ms
                         );
                     }
 
@@ -9087,7 +9242,7 @@ impl HttpProxy {
         // Requirements: IMA 1.2, 1.3, 2.1, 2.5, 4.3.
         let requested_range_bytes = range_spec.end - range_spec.start + 1;
         let ledger = s3_client.get_inflight_ledger();
-        let mut serve_reservation = match ledger.try_reserve(requested_range_bytes) {
+        let serve_reservation = match ledger.try_reserve(requested_range_bytes) {
             Some(r) => r,
             None => {
                 return Ok(Self::proxy_error_to_response(
@@ -9103,18 +9258,19 @@ impl HttpProxy {
         let perf_start = Instant::now();
         let data_load_start = Instant::now();
         let (range_data, _merge_metrics, is_ram_hit) = match Self::get_cached_range_data(
+            &method,
             range_spec,
             overlap,
             cache_key,
             &cache_manager,
             &range_handler,
-            s3_client,
+            Arc::clone(&s3_client),
             host,
             uri,
             headers,
             &config,
             resolved,
-            Some(&mut serve_reservation),
+            permit.clone(),
         )
         .await
         {
@@ -9126,6 +9282,28 @@ impl HttpProxy {
         // Resolve metadata for response headers
         let cached_metadata =
             Self::resolve_cached_metadata(preloaded_metadata, &cache_manager, cache_key).await;
+
+        if overlap
+            .cached_ranges
+            .iter()
+            .any(|range| range.etag != cached_metadata.etag)
+        {
+            return Ok(Self::forward_original_range_request(
+                &method,
+                cache_key,
+                range_spec,
+                &cache_manager,
+                &range_handler,
+                s3_client,
+                host,
+                uri,
+                headers,
+                &config,
+                resolved,
+                permit.clone(),
+            )
+            .await);
+        }
 
         // Get total object size from cached metadata for correct Content-Range header
         let total_object_size = cached_metadata.content_length;
@@ -9189,7 +9367,10 @@ impl HttpProxy {
         let cache_tier = if is_ram_hit { "RAM" } else { "Disk" };
         debug!(
             "GET {} range cache HIT for {} range {}-{}",
-            cache_tier, uri, range_spec.start, range_spec.end
+            cache_tier,
+            mask_presigned_params(uri),
+            range_spec.start,
+            range_spec.end
         );
 
         if method != Method::HEAD {
@@ -9197,12 +9378,12 @@ impl HttpProxy {
             if is_ram_hit {
                 debug!(
                     "PERF cache_hit path={} range={}-{} size={} ram_lookup_ms={} total_ms={} source=ram",
-                    uri, range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
+                    mask_presigned_params(uri), range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
                 );
             } else {
                 debug!(
                     "PERF cache_hit path={} range={}-{} size={} data_load_ms={} total_ms={} source=disk_buffered",
-                    uri, range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
+                    mask_presigned_params(uri), range_spec.start, range_spec.end, range_data_size, data_load_ms, total_ms
                 );
             }
         }
@@ -9210,23 +9391,11 @@ impl HttpProxy {
         Ok(response)
     }
 
-    /// Common logic to get cached range data
-    #[allow(clippy::too_many_arguments)]
-    // The Err variant is a full `Response` used to short-circuit directly into the
-    // HTTP response path via `?` at every call site. Boxing it would ripple through
-    // every construction and every `?` site for a toolchain-lint-only change; not
-    // worth the churn here. See clippy::result_large_err.
-    /// Cache repair that fails open.
-    ///
-    /// Called when a range the `.meta` names cannot be served as recorded: its file
-    /// is missing, truncated, or fails decompression, or the bytes are shorter than
-    /// the extent. The inconsistent record is evicted from disk and every RAM tier,
-    /// and the client is answered by forwarding ITS OWN request to S3 unchanged. No
-    /// header the client may have signed is touched, so a cache fault can never
-    /// surface as `SignatureDoesNotMatch`. The upstream response is cached by the
-    /// normal signed-range path, which repairs the entry for the next reader.
+    /// Evict inconsistent bytes and refetch the client's original request.
+    /// Preserve signed headers and return the upstream response's own headers.
     #[allow(clippy::too_many_arguments)]
     async fn fail_open_after_inconsistent_range(
+        method: &Method,
         cache_key: &str,
         cached_start: u64,
         cached_end: u64,
@@ -9240,11 +9409,44 @@ impl HttpProxy {
         headers: &HeaderMap,
         config: &Arc<Config>,
         resolved: &crate::bucket_settings::ResolvedSettings,
+        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> Response<BoxBody<Bytes, hyper::Error>> {
         cache_manager
             .evict_inconsistent_range(cache_key, cached_start, cached_end, reason)
             .await;
 
+        Self::forward_original_range_request(
+            method,
+            cache_key,
+            range_spec,
+            cache_manager,
+            range_handler,
+            s3_client,
+            host,
+            uri,
+            headers,
+            config,
+            resolved,
+            permit.clone(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_original_range_request(
+        method: &Method,
+        cache_key: &str,
+        range_spec: &RangeSpec,
+        cache_manager: &Arc<CacheManager>,
+        range_handler: &Arc<RangeHandler>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        host: &str,
+        uri: &str,
+        headers: &HeaderMap,
+        config: &Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Response<BoxBody<Bytes, hyper::Error>> {
         let client_headers: HashMap<String, String> = headers
             .iter()
             .map(|(key, value)| {
@@ -9259,7 +9461,7 @@ impl HttpProxy {
             Err(error) => {
                 error!(
                     "Failed to parse URI while failing open after an inconsistent cached range: uri={}, error={}",
-                    uri, error
+                    mask_presigned_params(uri), error
                 );
                 return Self::build_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -9270,29 +9472,44 @@ impl HttpProxy {
             }
         };
 
-        info!(
-            "Failing open to S3 with the client's original request after evicting an inconsistent cached range: cache_key={}, evicted={}-{}, requested={}-{}, reason={}",
-            cache_key, cached_start, cached_end, range_spec.start, range_spec.end, reason
-        );
-        match Self::forward_signed_range_request(
-            Method::GET,
-            uri,
-            host.to_string(),
-            client_headers,
-            cache_key.to_string(),
-            range_spec.clone(),
-            crate::range_handler::RangeOverlap::all_missing(range_spec),
-            Arc::clone(cache_manager),
-            Arc::clone(range_handler),
-            s3_client,
-            Arc::clone(config),
-            resolved,
-            &None,
-            None,
-            None,
-        )
-        .await
-        {
+        let result = if headers.contains_key(hyper::header::RANGE) {
+            Self::forward_signed_range_request(
+                method.clone(),
+                uri,
+                host.to_string(),
+                client_headers,
+                cache_key.to_string(),
+                range_spec.clone(),
+                crate::range_handler::RangeOverlap::all_missing(range_spec),
+                Arc::clone(cache_manager),
+                Arc::clone(range_handler),
+                s3_client,
+                Arc::clone(config),
+                resolved,
+                &None,
+                None,
+                permit,
+            )
+            .await
+        } else {
+            Self::forward_get_head_to_s3_and_cache(
+                method.clone(),
+                uri,
+                host.to_string(),
+                client_headers,
+                cache_key.to_string(),
+                Arc::clone(cache_manager),
+                s3_client,
+                Arc::clone(range_handler),
+                Arc::clone(config),
+                resolved,
+                &None,
+                None,
+                permit,
+            )
+            .await
+        };
+        match result {
             Ok(response) => response,
             Err(never) => match never {},
         }
@@ -9301,6 +9518,7 @@ impl HttpProxy {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::result_large_err)]
     async fn get_cached_range_data(
+        method: &Method,
         range_spec: &RangeSpec,
         overlap: &crate::range_handler::RangeOverlap,
         cache_key: &str,
@@ -9312,106 +9530,35 @@ impl HttpProxy {
         headers: &HeaderMap,
         config: &Arc<Config>,
         resolved: &crate::bucket_settings::ResolvedSettings,
-        // The reservation the caller already holds for `range_spec`'s bytes.
-        // Every recovery/repair fetch below buffers bytes this request's
-        // response is built from, so they claim through this reservation rather
-        // than taking a second one for the same memory. See
-        // `InflightLedger::claim_overlapping`.
-        mut caller_reservation: Option<&mut crate::inflight_ledger::Reservation>,
+        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     ) -> std::result::Result<
         (Bytes, Option<(u64, u64, usize, f64)>, bool),
         Response<BoxBody<Bytes, hyper::Error>>,
     > {
         // Track whether data came from RAM cache
         let is_ram_hit: bool;
-        // Both cache-recovery paths below may need a complete upstream range
-        // fetch. Build the request representation once so a cache hole degrades
-        // to a miss instead of becoming a response-construction failure.
-        let fallback_headers: HashMap<String, String> = headers
-            .iter()
-            .map(|(key, value)| {
-                (
-                    key.as_str().to_string(),
-                    value.to_str().unwrap_or("").to_string(),
-                )
-            })
-            .collect();
-        let host_header = headers
-            .get(hyper::header::HOST)
-            .and_then(|value| value.to_str().ok());
-        let authority = crate::s3_client::build_egress_authority(host, host_header);
-        let fallback_uri: hyper::Uri = match format!("https://{}{}", authority, uri).parse() {
-            Ok(uri) => uri,
-            Err(error) => {
-                error!("Failed to parse URI for cached-range fallback: {}", error);
-                return Err(Self::build_error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "InternalError",
-                    "Failed to build request URI",
-                    None,
-                ));
-            }
-        };
-
         // Get the cached data
         let (range_data, merge_metrics) = if overlap.cached_ranges.len() == 1 {
             // Single cached range
             let cached_range = &overlap.cached_ranges[0];
 
-            // A single cached extent can overlap without containing the client
-            // range. Do not subtract offsets until containment is proven: route
-            // the incomplete extent through the same complete-fetch fallback as
-            // multi-extent merge gaps.
             if cached_range.start > range_spec.start || cached_range.end < range_spec.end {
-                let merge_result = match range_handler
-                    .merge_ranges_with_fallback(
-                        cache_key,
-                        range_spec,
-                        &overlap.cached_ranges,
-                        &[],
-                        &s3_client,
-                        host,
-                        &fallback_uri,
-                        &fallback_headers,
-                        caller_reservation.as_deref_mut(),
-                    )
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(error @ crate::ProxyError::InflightCeilingExceeded { .. }) => {
-                        // Reachable via the incomplete-range fallback: the recovery
-                        // path's own complete S3 refetch reserves against the
-                        // in-flight ledger and can be refused under memory
-                        // pressure. That refusal is a Shed_Response (503 SlowDown
-                        // + Retry-After), not the generic 502 the arm below
-                        // produces — a memory-pressure rejection is transient and
-                        // must stay retryable, so it must not fall through.
-                        // Requirements: IMA 2.1, 2.2.
-                        return Err(Self::proxy_error_to_response(&error));
-                    }
-                    Err(error) => {
-                        error!(
-                            "Failed to recover partially covered cached range: {}",
-                            error
-                        );
-                        return Err(Self::build_error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "BadGateway",
-                            "Failed to fetch incomplete cached range.",
-                            None,
-                        ));
-                    }
-                };
-                return Ok((
-                    merge_result.data,
-                    Some((
-                        merge_result.bytes_from_cache,
-                        merge_result.bytes_from_s3,
-                        merge_result.segments_merged,
-                        merge_result.cache_efficiency,
-                    )),
-                    merge_result.ram_hit,
-                ));
+                cache_manager.record_incomplete_range_fallback();
+                return Err(Self::forward_original_range_request(
+                    method,
+                    cache_key,
+                    range_spec,
+                    cache_manager,
+                    range_handler,
+                    Arc::clone(&s3_client),
+                    host,
+                    uri,
+                    headers,
+                    config,
+                    resolved,
+                    permit.clone(),
+                )
+                .await);
             }
 
             let data = {
@@ -9429,6 +9576,23 @@ impl HttpProxy {
                         );
                         data
                     }
+                    Err(crate::ProxyError::CacheVersionMismatch { .. }) => {
+                        return Err(Self::forward_original_range_request(
+                            method,
+                            cache_key,
+                            range_spec,
+                            cache_manager,
+                            range_handler,
+                            Arc::clone(&s3_client),
+                            host,
+                            uri,
+                            headers,
+                            config,
+                            resolved,
+                            permit.clone(),
+                        )
+                        .await);
+                    }
                     Err(e) => {
                         // The `.meta` names this range but its bytes cannot be read
                         // (deleted by a concurrent invalidation, truncated, or failing
@@ -9440,6 +9604,7 @@ impl HttpProxy {
                         // open: drop the inconsistent record and forward the client's
                         // own request unchanged.
                         return Err(Self::fail_open_after_inconsistent_range(
+                            method,
                             cache_key,
                             cached_range.start,
                             cached_range.end,
@@ -9453,6 +9618,7 @@ impl HttpProxy {
                             headers,
                             config,
                             resolved,
+                            permit.clone(),
                         )
                         .await);
                     }
@@ -9495,6 +9661,7 @@ impl HttpProxy {
                         slice_end, data.len(), cache_key, cached_range.start, cached_range.end, range_spec.start, range_spec.end
                     );
                         return Err(Self::fail_open_after_inconsistent_range(
+                            method,
                             cache_key,
                             cached_range.start,
                             cached_range.end,
@@ -9508,6 +9675,7 @@ impl HttpProxy {
                             headers,
                             config,
                             resolved,
+                            permit.clone(),
                         )
                         .await);
                     }
@@ -9537,6 +9705,7 @@ impl HttpProxy {
                 // do not keep them: evict the record and answer from S3 with the
                 // client's own request.
                 return Err(Self::fail_open_after_inconsistent_range(
+                    method,
                     cache_key,
                     cached_range.start,
                     cached_range.end,
@@ -9550,6 +9719,7 @@ impl HttpProxy {
                     headers,
                     config,
                     resolved,
+                    permit.clone(),
                 )
                 .await);
             }
@@ -9580,20 +9750,10 @@ impl HttpProxy {
                 );
             }
 
-            // Merge every cached segment and degrade to a complete upstream
-            // range fetch if the cache no longer covers the request.
+            // A refetch must carry its own S3 headers. A byte-only fallback
+            // could attach an old cached ETag to a newly fetched version.
             match range_handler
-                .merge_ranges_with_fallback(
-                    cache_key,
-                    range_spec,
-                    &overlap.cached_ranges,
-                    &[],
-                    &s3_client,
-                    host,
-                    &fallback_uri,
-                    &fallback_headers,
-                    caller_reservation,
-                )
+                .merge_range_segments(cache_key, range_spec, &overlap.cached_ranges, &[])
                 .await
             {
                 Ok(merge_result) => {
@@ -9626,25 +9786,26 @@ impl HttpProxy {
                         )),
                     )
                 }
-                Err(e @ crate::ProxyError::InflightCeilingExceeded { .. }) => {
-                    // Reachable via the incomplete-range fallback: when the merge
-                    // finds a gap it degrades to a complete S3 refetch, which
-                    // reserves against the in-flight ledger and can be refused
-                    // under memory pressure. That refusal is a Shed_Response (503
-                    // SlowDown + Retry-After), not the generic 500 the arm below
-                    // produces — a memory-pressure rejection is transient and must
-                    // stay retryable, so it must not fall through.
-                    // Requirements: IMA 2.1, 2.2.
-                    return Err(Self::proxy_error_to_response(&e));
-                }
-                Err(e) => {
-                    error!("Failed to merge cached ranges: {}", e);
-                    return Err(Self::build_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "InternalError",
-                        "Failed to merge cached ranges.",
-                        None,
-                    ));
+                Err(error) => {
+                    if matches!(&error, crate::ProxyError::CacheError(message) if message.contains("Gap") || message.contains("alignment"))
+                    {
+                        cache_manager.record_incomplete_range_fallback();
+                    }
+                    return Err(Self::forward_original_range_request(
+                        method,
+                        cache_key,
+                        range_spec,
+                        cache_manager,
+                        range_handler,
+                        Arc::clone(&s3_client),
+                        host,
+                        uri,
+                        headers,
+                        config,
+                        resolved,
+                        permit.clone(),
+                    )
+                    .await);
                 }
             }
         };
@@ -11065,10 +11226,12 @@ impl HttpProxy {
                             range_handler,
                             s3_client,
                             &host,
-                            uri.path(),
+                            uri.path_and_query()
+                                .map_or(uri.path(), |value| value.as_str()),
                             &header_map,
                             config,
                             resolved,
+                            permit,
                         )
                         .await
                     }
@@ -11387,10 +11550,12 @@ impl HttpProxy {
             range_handler,
             s3_client,
             host,
-            uri.path(),
+            uri.path_and_query()
+                .map_or(uri.path(), |value| value.as_str()),
             &header_map,
             config,
             resolved,
+            None,
         )
         .await
     }
@@ -12316,6 +12481,43 @@ impl HttpProxy {
         };
 
         // Success path — process the S3 response
+        Self::respond_with_object_and_cache(
+            s3_response,
+            s3_fetch_start,
+            method,
+            uri,
+            headers,
+            cache_key,
+            cache_manager,
+            s3_client,
+            range_handler,
+            config,
+            resolved,
+            coordination_guard,
+            permit,
+        )
+        .await
+    }
+
+    /// Answer with an object GET or HEAD response already received from S3 and
+    /// cache it. Shared by the miss path and by revalidation, whose conditional
+    /// request already carries a changed object's bytes.
+    #[allow(clippy::too_many_arguments)]
+    async fn respond_with_object_and_cache(
+        s3_response: crate::s3_client::S3Response,
+        s3_fetch_start: Instant,
+        method: Method,
+        uri: hyper::Uri,
+        headers: HashMap<String, String>,
+        cache_key: String,
+        cache_manager: Arc<CacheManager>,
+        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
+        range_handler: Arc<RangeHandler>,
+        config: Arc<Config>,
+        resolved: &crate::bucket_settings::ResolvedSettings,
+        coordination_guard: Option<FetchGuard>,
+        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
         match Ok::<_, crate::ProxyError>(s3_response) {
             Ok(s3_response) => {
                 let s3_fetch_ms = s3_fetch_start.elapsed().as_millis();
@@ -13007,7 +13209,6 @@ impl HttpProxy {
                         return Self::handle_signed_range_s3_response(
                             s3_response,
                             cache_key,
-                            range_spec,
                             overlap,
                             range_handler,
                             s3_client,
@@ -13059,7 +13260,6 @@ impl HttpProxy {
                         return Self::handle_signed_range_s3_response(
                             s3_response,
                             cache_key,
-                            range_spec,
                             overlap,
                             range_handler,
                             s3_client,
@@ -13113,7 +13313,6 @@ impl HttpProxy {
     async fn handle_signed_range_s3_response(
         s3_response: crate::s3_client::S3Response,
         cache_key: String,
-        range_spec: RangeSpec,
         overlap: crate::range_handler::RangeOverlap,
         range_handler: Arc<RangeHandler>,
         s3_client: Arc<dyn S3ClientApi + Send + Sync>,
@@ -13127,7 +13326,12 @@ impl HttpProxy {
         // spawned per-range cache-write tasks reuse these values rather than
         // re-resolving (Requirement 8.2). The effective decision additionally
         // folds in the size threshold and the built-in denylist (rules-win).
-        let range_size = range_spec.end.saturating_sub(range_spec.start) + 1;
+        // Cache the extent the response carries, as
+        // `convert_s3_response_to_http_with_caching` does: S3 resolves a signed
+        // suffix or open-ended Range against the object as it is now, which
+        // `range_spec` may not match.
+        let cached_extent = Self::response_extent(&s3_response);
+        let range_size = cached_extent.map_or(0, |(start, end)| end - start + 1);
         let compression_enabled = range_handler
             .get_cache_manager()
             .effective_compression(resolved, &cache_key, range_size);
@@ -13153,12 +13357,16 @@ impl HttpProxy {
                     // Streaming response - cache while streaming to client (Requirement 2.4)
                     // Cache the entire response as a single range
 
-                    if !overlap.missing_ranges.is_empty() && etag.is_some() {
+                    if let (false, true, Some((start, end))) = (
+                        overlap.missing_ranges.is_empty(),
+                        etag.is_some(),
+                        cached_extent,
+                    ) {
                         // Clone the Arc<Mutex<DiskCacheManager>> for use in spawned task
                         let disk_cache = Arc::clone(range_handler.get_disk_cache_manager());
                         let cache_manager = Arc::clone(range_handler.get_cache_manager());
                         let cache_key_clone = cache_key.clone();
-                        let range_spec_clone = range_spec.clone();
+                        let range_spec_clone = RangeSpec { start, end };
                         let _etag_clone = etag.clone().unwrap();
 
                         // Extract complete object metadata from S3 response headers to preserve all headers
@@ -13182,8 +13390,7 @@ impl HttpProxy {
                             // Held for the task's lifetime; dropped at task exit, releasing
                             // this share of the Owned_Permit (TCA 2.2, 2.5).
                             let _spawn_permit = spawn_permit;
-                            let start = range_spec_clone.start;
-                            let end = range_spec_clone.end;
+                            let RangeSpec { start, end } = range_spec_clone;
                             let expected_size = end - start + 1;
 
                             // Check capacity and evict if needed before beginning the write.
@@ -13328,7 +13535,7 @@ impl HttpProxy {
 
                         // Wrap with download bandwidth QoS throttle.
                         let range_bucket_sr = cache_key.split('/').next();
-                        let range_known_len_sr = Some(range_spec.end - range_spec.start + 1);
+                        let range_known_len_sr = cached_extent.map(|(start, end)| end - start + 1);
                         let throttled = wrap_origin_stream(
                             tee_stream,
                             &std::collections::HashMap::new(),
@@ -13413,11 +13620,15 @@ impl HttpProxy {
                 }
                 Some(S3ResponseBody::Buffered(bytes)) => {
                     // Buffered response - cache asynchronously to avoid blocking client
-                    if !overlap.missing_ranges.is_empty() && etag.is_some() {
+                    if let (false, true, Some((start, end))) = (
+                        overlap.missing_ranges.is_empty(),
+                        etag.is_some(),
+                        cached_extent,
+                    ) {
                         let disk_cache = Arc::clone(range_handler.get_disk_cache_manager());
                         let cache_manager = Arc::clone(range_handler.get_cache_manager());
                         let cache_key_clone = cache_key.clone();
-                        let range_spec_clone = range_spec.clone();
+                        let range_spec_clone = RangeSpec { start, end };
                         let ttl = config.cache.get_ttl;
                         let bytes_clone = bytes.clone();
 
@@ -13855,6 +14066,26 @@ impl HttpProxy {
                         }
                         Ok(response_builder.body(response_body).unwrap())
                     }
+                    Err(crate::ProxyError::CacheVersionMismatch { .. }) => {
+                        // The object changed between the lookup and the sub-fetches.
+                        // Forward the client's request so body and headers come
+                        // from one version.
+                        Self::stream_range_from_s3_with_caching(
+                            method,
+                            uri,
+                            host,
+                            headers,
+                            cache_key,
+                            range_spec,
+                            range_handler,
+                            s3_client,
+                            config,
+                            resolved,
+                            coordination_guard,
+                            permit,
+                        )
+                        .await
+                    }
                     Err(e @ crate::ProxyError::InflightCeilingExceeded { .. }) => {
                         // A ledger rejection is a Shed_Response (503 SlowDown), not
                         // the generic 500 the arm below produces — the whole point
@@ -13938,19 +14169,19 @@ impl HttpProxy {
 
         // Build S3 request context with range header and streaming enabled
         let mut s3_headers = headers.clone();
-        if crate::signed_request_proxy::is_range_signed(&s3_headers) {
-            // The client signed `range`: its header goes upstream byte-for-byte.
-            // `range_spec` was parsed from that same header, so caching the response
-            // under it below stays correct, and a suffix or open-ended form keeps the
-            // exact string the signature covers.
+        if s3_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("range"))
+        {
+            // The client's own Range goes upstream verbatim: a signature may cover
+            // it, and S3 resolves a suffix or open-ended form against the object as
+            // it is now, where `range_spec` used the cached size. The response is
+            // cached by its own Content-Range, not by `range_spec`.
             debug!(
-                "Forwarding the client's signed Range header verbatim: range={}-{} cache_key={}",
+                "Forwarding the client's Range header verbatim: range={}-{} cache_key={}",
                 range_spec.start, range_spec.end, cache_key
             );
         } else {
-            // Remove any existing Range header (case-insensitive) to avoid duplicates
-            s3_headers.retain(|k, _| k.to_lowercase() != "range");
-            // Insert new Range header with proper capitalization
             s3_headers.insert(
                 "Range".to_string(),
                 format!("bytes={}-{}", range_spec.start, range_spec.end),

@@ -495,10 +495,19 @@ impl S3ClientApi for StubS3Client {
             .or_else(|| headers.get("Last-Modified"))
             .cloned()
             .unwrap_or_default();
+        // Like the real client, a range response's object size is the
+        // Content-Range total, not the response's Content-Length.
         let content_length = headers
-            .get("content-length")
-            .or_else(|| headers.get("Content-Length"))
-            .and_then(|s| s.parse().ok())
+            .get("content-range")
+            .or_else(|| headers.get("Content-Range"))
+            .and_then(|range| range.rsplit_once('/'))
+            .and_then(|(_, total)| total.parse().ok())
+            .or_else(|| {
+                headers
+                    .get("content-length")
+                    .or_else(|| headers.get("Content-Length"))
+                    .and_then(|s| s.parse().ok())
+            })
             .unwrap_or(0);
         let content_type = headers
             .get("content-type")

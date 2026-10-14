@@ -745,8 +745,8 @@ impl WriteCacheManager {
         // Ranges whose `.bin` existed AND was removed without error. R5.4: this is the
         // only list the accounting below may be built from — `metadata.ranges` would
         // include files that were already gone, producing a phantom debit.
-        // Tuple: (range_start, range_end, compressed_size, bin_file_path, counts_as_staged)
-        let mut deleted_ranges: Vec<(u64, u64, u64, String, bool)> = Vec::new();
+        // Tuple: (range, bin_file_path, counts_as_staged)
+        let mut deleted_ranges: Vec<(crate::cache_types::RangeSpec, String, bool)> = Vec::new();
 
         // Delete all range files
         for range in &metadata.ranges {
@@ -757,9 +757,7 @@ impl WriteCacheManager {
                 } else {
                     total_freed += range.compressed_size;
                     deleted_ranges.push((
-                        range.start,
-                        range.end,
-                        range.compressed_size,
+                        range.clone(),
                         range_path.to_string_lossy().to_string(),
                         // Classified from the `.meta` THIS call read, not from the state
                         // the candidate walk saw — see the graduation-race note on this
@@ -802,21 +800,18 @@ impl WriteCacheManager {
                 // exactly as read-tier eviction's Step 5 does it. A graduated entry has
                 // already had its write-cache bytes debited by its `Graduation` entry, so
                 // debiting again here would remove them twice.
-                for (start, end, compressed_size, _path, counts_as_staged) in &deleted_ranges {
-                    // `subtract_range` rather than `subtract`, so the range's dedup
-                    // entry is released along with its bytes and a later re-cache of
-                    // the same range can be credited again. See
-                    // `SizeAccumulator::subtract_range`.
-                    consolidator.size_accumulator().subtract_range(
-                        cache_key,
-                        *start,
-                        *end,
-                        *compressed_size,
-                    );
+                for (range, _path, counts_as_staged) in &deleted_ranges {
+                    // `subtract_range_file` rather than `subtract`, so this file's
+                    // dedup entry is released along with its bytes and a later
+                    // re-cache of the same range can be credited again. See
+                    // `SizeAccumulator::subtract_range_file`.
+                    consolidator
+                        .size_accumulator()
+                        .subtract_range_file(cache_key, range);
                     if *counts_as_staged {
                         consolidator
                             .size_accumulator()
-                            .subtract_write_cache(*compressed_size);
+                            .subtract_write_cache(range.compressed_size);
                     }
                 }
 
@@ -827,12 +822,12 @@ impl WriteCacheManager {
                 if !deleted_ranges.is_empty() {
                     let journal_entries: Vec<(String, u64, u64, u64, String)> = deleted_ranges
                         .iter()
-                        .map(|(start, end, compressed_size, path, _counts_as_staged)| {
+                        .map(|(range, path, _counts_as_staged)| {
                             (
                                 cache_key.to_string(),
-                                *start,
-                                *end,
-                                *compressed_size,
+                                range.start,
+                                range.end,
+                                range.compressed_size,
                                 path.clone(),
                             )
                         })

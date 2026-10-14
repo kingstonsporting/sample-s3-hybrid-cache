@@ -2620,8 +2620,13 @@ impl SignedPutHandler {
             // Part file is in the upload directory
             let old_part_file = multipart_dir.join(format!("part{}.bin", part_number));
 
-            // New range file path (with byte offset suffix) in the sharded ranges directory
-            let suffix = format!("_{}-{}.bin", start, end);
+            // New range file path (byte offsets and object version) in the sharded ranges directory
+            let suffix = format!(
+                "_{}-{}.{}.bin",
+                start,
+                end,
+                crate::disk_cache::object_version_id(etag)
+            );
             let new_range_file_path =
                 crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, &suffix).map_err(
                     |e| {
@@ -3708,9 +3713,10 @@ impl SignedPutHandler {
         // reservation — is moved in and returned so it stays alive until the explicit
         // `drop(sink)` below, after the `.meta` write, matching the buffered path's
         // reservation lifetime.
+        let etag = object_metadata.etag.clone();
         let (sink, finalize_res) = match tokio::task::spawn_blocking(move || {
             let mut sink = sink;
-            let res = sink.finalize();
+            let res = sink.finalize(&etag);
             (sink, res)
         })
         .await
@@ -6160,10 +6166,20 @@ mod tests {
         // Verify parts 1 and 3 were moved to final byte offsets in ranges/
         // Part 1: 0-1023, Part 3: 1024-1535 (since part 2 is skipped)
         let ranges_dir = temp_dir.path().join("ranges");
-        let final_part1_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_0-1023.bin").unwrap();
-        let final_part3_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_1024-1535.bin").unwrap();
+        // Completed ranges are named for the quoted ETag the `.meta` stores.
+        let version = crate::disk_cache::object_version_id(&format!("\"{}\"", etag));
+        let final_part1_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_0-1023.{}.bin", version),
+        )
+        .unwrap();
+        let final_part3_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_1024-1535.{}.bin", version),
+        )
+        .unwrap();
 
         assert!(
             final_part1_file.exists(),
@@ -6259,15 +6275,29 @@ mod tests {
 
         // Verify all parts were renamed to final byte offsets
         let ranges_dir = temp_dir.path().join("ranges");
+        // Completed ranges are named for the quoted ETag the `.meta` stores.
+        let version = crate::disk_cache::object_version_id(&format!("\"{}\"", etag));
         // Part 1: 0-1023 (1024 bytes)
         // Part 2: 1024-3071 (2048 bytes)
         // Part 3: 3072-3583 (512 bytes)
-        let final_part1_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_0-1023.bin").unwrap();
-        let final_part2_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_1024-3071.bin").unwrap();
-        let final_part3_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_3072-3583.bin").unwrap();
+        let final_part1_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_0-1023.{}.bin", version),
+        )
+        .unwrap();
+        let final_part2_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_1024-3071.{}.bin", version),
+        )
+        .unwrap();
+        let final_part3_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_3072-3583.{}.bin", version),
+        )
+        .unwrap();
 
         assert!(
             final_part1_file.exists(),
@@ -6509,15 +6539,29 @@ mod tests {
 
         // Verify all parts were renamed to final byte offsets
         let ranges_dir = temp_dir.path().join("ranges");
+        // Completed ranges are named for the quoted ETag the `.meta` stores.
+        let version = crate::disk_cache::object_version_id(&format!("\"{}\"", etag));
         // Part 1: 0-1023 (1024 bytes)
         // Part 3: 1024-3071 (2048 bytes) - starts right after part 1
         // Part 5: 3072-3583 (512 bytes) - starts right after part 3
-        let final_part1_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_0-1023.bin").unwrap();
-        let final_part3_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_1024-3071.bin").unwrap();
-        let final_part5_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_3072-3583.bin").unwrap();
+        let final_part1_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_0-1023.{}.bin", version),
+        )
+        .unwrap();
+        let final_part3_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_1024-3071.{}.bin", version),
+        )
+        .unwrap();
+        let final_part5_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_3072-3583.{}.bin", version),
+        )
+        .unwrap();
 
         assert!(
             final_part1_file.exists(),
@@ -6637,6 +6681,8 @@ mod tests {
 
         // Verify unreferenced parts were deleted
         let ranges_dir = temp_dir.path().join("ranges");
+        // Completed ranges are named for the quoted ETag the `.meta` stores.
+        let version = crate::disk_cache::object_version_id(&format!("\"{}\"", etag));
         let part1_file =
             crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_part1_0-999.bin")
                 .unwrap();
@@ -6663,10 +6709,18 @@ mod tests {
         // Verify requested parts were renamed to final byte offsets
         // Part 2: 0-1999 (2000 bytes) - starts at 0 since it's the first requested part
         // Part 4: 2000-5999 (4000 bytes) - starts right after part 2
-        let final_part2_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_0-1999.bin").unwrap();
-        let final_part4_file =
-            crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, "_2000-5999.bin").unwrap();
+        let final_part2_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_0-1999.{}.bin", version),
+        )
+        .unwrap();
+        let final_part4_file = crate::disk_cache::get_sharded_path(
+            &ranges_dir,
+            cache_key,
+            &format!("_2000-5999.{}.bin", version),
+        )
+        .unwrap();
 
         assert!(
             final_part2_file.exists(),
@@ -7391,9 +7445,12 @@ mod tests {
         .unwrap()
     }
 
+    /// The ETag `ok_response_info` returns, as the committed `.meta` stores it.
+    const STREAM_ETAG: &str = "\"stream-etag\"";
+
     fn ok_response_info() -> ResponseInfo {
         let mut headers = HeaderMap::new();
-        headers.insert("etag", "\"stream-etag\"".parse().unwrap());
+        headers.insert("etag", STREAM_ETAG.parse().unwrap());
         ResponseInfo {
             status: StatusCode::OK,
             headers,
@@ -7417,7 +7474,8 @@ mod tests {
         let object: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
 
         let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
-        let final_path = dc.get_new_range_file_path(cache_key, 0, (object.len() as u64) - 1);
+        let final_path =
+            dc.get_versioned_range_file_path(cache_key, 0, (object.len() as u64) - 1, STREAM_ETAG);
         let sink = open_streaming_sink(dc, cache_key, object.len() as u64).await;
 
         let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
@@ -7578,7 +7636,8 @@ mod tests {
         let encoded = aws_chunked_single_chunk(payload);
 
         let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
-        let final_path = dc.get_new_range_file_path(cache_key, 0, (payload.len() as u64) - 1);
+        let final_path =
+            dc.get_versioned_range_file_path(cache_key, 0, (payload.len() as u64) - 1, STREAM_ETAG);
         let sink = open_streaming_sink(dc, cache_key, payload.len() as u64).await;
 
         let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
@@ -7664,7 +7723,8 @@ mod tests {
         );
 
         let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
-        let final_path = dc.get_new_range_file_path(cache_key, 0, (payload.len() as u64) - 1);
+        let final_path =
+            dc.get_versioned_range_file_path(cache_key, 0, (payload.len() as u64) - 1, STREAM_ETAG);
         let sink = open_streaming_sink(dc, cache_key, payload.len() as u64).await;
 
         let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);
@@ -7732,7 +7792,8 @@ mod tests {
         let claimed_len: u64 = 9999; // deliberately wrong
 
         let dc = make_streaming_disk_cache(&temp_dir, 4096).await;
-        let final_path = dc.get_new_range_file_path(cache_key, 0, claimed_len - 1);
+        let final_path =
+            dc.get_versioned_range_file_path(cache_key, 0, claimed_len - 1, STREAM_ETAG);
         let sink = open_streaming_sink(dc, cache_key, claimed_len).await;
 
         let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<Bytes>(4);

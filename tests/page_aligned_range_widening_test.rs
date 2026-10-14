@@ -841,7 +841,12 @@ async fn ram_cache_eligible_false_skips_page_promotion() {
 
     // The Page's cold-fetch fill must NOT have promoted it to RAM, because
     // `ram_cache_eligible` is false. A direct page-keyed RAM lookup must miss.
-    let ram_hit = cache_manager.get_range_from_ram_cache(&cache_key, page_start, page_end);
+    let ram_hit = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        page_start,
+        page_end,
+        "\"ram-ineligible-etag\"",
+    );
     assert!(
         ram_hit.is_none(),
         "page must not be promoted to RAM when ram_cache_eligible is false"
@@ -1000,8 +1005,12 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
         .await
         .expect("consolidation should succeed");
 
-    let ram_hit_before_any_read =
-        cache_manager.get_range_from_ram_cache(&cache_key, range_start, range_end);
+    let ram_hit_before_any_read = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        range_start,
+        range_end,
+        "\"non-widened-etag\"",
+    );
     assert!(
         ram_hit_before_any_read.is_none(),
         "a freshly disk-stored range must not be in RAM before any read"
@@ -1061,8 +1070,12 @@ async fn widening_off_disk_hit_promotes_to_ram_and_second_read_is_ram_hit() {
     assert_eq!(response1.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(body_bytes(response1).await, body_data);
 
-    let ram_hit_after_first =
-        cache_manager.get_range_from_ram_cache(&cache_key, range_start, range_end);
+    let ram_hit_after_first = cache_manager.get_range_from_ram_cache(
+        &cache_key,
+        range_start,
+        range_end,
+        "\"non-widened-etag\"",
+    );
     assert!(
         ram_hit_after_first.is_some(),
         "a disk hit must promote the range to RAM, exactly as the \
@@ -2242,13 +2255,13 @@ async fn straddle_with_both_pages_in_ram_serves_with_no_s3_fetch() {
     // Confirm both Pages are actually RAM-resident before the straddling read.
     assert!(
         cache_manager
-            .get_range_from_ram_cache(&cache_key, page0_start, page0_end)
+            .get_range_from_ram_cache(&cache_key, page0_start, page0_end, &known_etag)
             .is_some(),
         "page 0 must be RAM-resident after warming"
     );
     assert!(
         cache_manager
-            .get_range_from_ram_cache(&cache_key, page1_start, page1_end)
+            .get_range_from_ram_cache(&cache_key, page1_start, page1_end, &known_etag)
             .is_some(),
         "page 1 must be RAM-resident after warming"
     );
@@ -2501,7 +2514,7 @@ async fn conditional_if_match_fail_passes_through_412() {
 
     // No caching should have happened for a 412 (no bytes to cache).
     assert!(cache_manager
-        .get_range_from_ram_cache(&cache_key, 0, PAGE_SIZE - 1)
+        .get_range_from_ram_cache(&cache_key, 0, PAGE_SIZE - 1, "")
         .is_none());
 }
 

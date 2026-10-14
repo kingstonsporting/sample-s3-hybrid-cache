@@ -77,7 +77,12 @@ async fn test_cache_lookup_diagnostic_basic() {
 
     // Requirement 4.3: Verify the range binary file exists at the expected path
     println!("\n=== STEP 3: Verifying range binary file ===");
-    let range_path = cache_manager.get_new_range_file_path(cache_key, range_start, range_end);
+    let range_path = cache_manager.get_versioned_range_file_path(
+        cache_key,
+        range_start,
+        range_end,
+        &object_metadata.etag,
+    );
     println!("Expected range path: {:?}", range_path);
     assert!(
         range_path.exists(),
@@ -244,7 +249,12 @@ async fn test_cache_lookup_diagnostic_key_formats() {
 
         // Verify files exist
         let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
-        let range_path = cache_manager.get_new_range_file_path(cache_key, range_start, range_end);
+        let range_path = cache_manager.get_versioned_range_file_path(
+            cache_key,
+            range_start,
+            range_end,
+            &object_metadata.etag,
+        );
 
         assert!(
             metadata_path.exists(),

@@ -115,6 +115,7 @@ use tempfile::TempDir;
 use s3_proxy::bucket_settings::ResolvedSettings;
 use s3_proxy::cache::{CacheEvictionAlgorithm, CacheManager};
 use s3_proxy::config::Config;
+use s3_proxy::disk_cache::{object_version_id, range_file_belongs_to};
 // NOTE: this file predates `tests/common/expired_fixture.rs` and carries its own
 // copy of the seeder and infra builder. Consolidating them is worthwhile but was
 // deliberately not done in the same change as the purpose enum: the R3.5 evidence
@@ -364,11 +365,14 @@ async fn seed_cached_extents(
         // Old bytes, so any surviving stale extent is byte-distinguishable from
         // the fresh representation.
         let body = vec![OLD_FILL; (end - start + 1) as usize];
+        // Named for the seeded version: readers only trust range files that
+        // carry the version of the `.meta`'s ETag.
         let bin_relative = format!(
-            "bucket/00/000/{}_{}-{}.bin",
+            "bucket/00/000/{}_{}-{}.{}.bin",
             sanitise(cache_key),
             start,
-            end
+            end,
+            object_version_id(seed_etag)
         );
         let bin_path = cache_manager
             .get_cache_dir()
@@ -474,6 +478,7 @@ async fn seed_cached_extents(
         RANGE_START,
         RANGE_END
     );
+    let version_id = object_version_id(&metadata.object_metadata.etag);
     for r in &metadata.ranges {
         let bin = cache_manager
             .get_cache_dir()
@@ -483,6 +488,12 @@ async fn seed_cached_extents(
             bin.exists(),
             "PRECONDITION MISSING: range file absent at {:?}; Candidate_Available is false",
             bin
+        );
+        assert!(
+            range_file_belongs_to(r, &version_id),
+            "PRECONDITION MISSING: range file {:?} is not named for the stored ETag, so \
+             readers never trust it; Candidate_Available is false",
+            r.file_path
         );
     }
 
@@ -618,6 +629,13 @@ async fn changed_206_range_revalidation_must_not_serve_stale_cached_bytes() {
         StatusCode::PARTIAL_CONTENT,
         "range semantics must be retained across the changed-object refetch"
     );
+    assert_eq!(
+        captured.len(),
+        1,
+        "the conditional 206 already carries the changed object's bytes; fetching \
+         them again doubles the transfer. Captured requests: {:#?}",
+        captured
+    );
 }
 
 /// The `200` counterpart. R7.4 requires both statuses covered, and this one has
@@ -709,6 +727,13 @@ async fn changed_200_range_revalidation_must_not_serve_stale_cached_bytes() {
         "the client must receive the fresh representation (status={}, {} bytes)",
         status,
         body.len()
+    );
+    assert_eq!(
+        captured.len(),
+        1,
+        "the conditional 200 already carries the changed object's bytes; fetching \
+         them again doubles the transfer. Captured requests: {:#?}",
+        captured
     );
 }
 
@@ -804,10 +829,11 @@ async fn changed_206_range_revalidation_must_not_serve_surviving_stale_extents()
                 .get_cache_dir()
                 .join("ranges")
                 .join(format!(
-                    "bucket/00/000/{}_{}-{}.bin",
+                    "bucket/00/000/{}_{}-{}.{}.bin",
                     sanitise(cache_key),
                     s,
-                    e
+                    e,
+                    object_version_id(&stored_etag)
                 ))
                 .exists()
         })
@@ -929,4 +955,138 @@ async fn changed_206_range_revalidation_must_not_serve_surviving_stale_extents()
         surviving,
         post_state
     );
+}
+
+/// A suffix Range is resolved against the cached object size, which is stale
+/// once the object has been overwritten with a different size. S3 answers with
+/// the true tail, and those bytes must be cached at the offsets its
+/// Content-Range reports, never at the offsets the stale resolution produced.
+#[tokio::test]
+async fn signed_suffix_read_after_resize_caches_bytes_at_their_true_offsets() {
+    suffix_read_after_resize("host;range;x-amz-date", true).await;
+}
+
+/// The unsigned form goes upstream verbatim too, so S3 resolves the suffix
+/// against the current object rather than the proxy's stale size. This path
+/// caches only streamed bodies and the stub buffers, so the assertion here is
+/// that the client gets the true tail and nothing lands at the stale offsets.
+#[tokio::test]
+async fn unsigned_suffix_read_after_resize_never_caches_at_stale_offsets() {
+    suffix_read_after_resize("host;x-amz-date", false).await;
+}
+
+async fn suffix_read_after_resize(signed_headers: &str, stub_body_is_cached: bool) {
+    let config = test_config();
+    let (_temp, cache_manager, range_handler, inflight_tracker) = make_infra(&config).await;
+    let cache_key = &format!("bucket/suffix-after-resize-{}.bin", signed_headers.len());
+    seed_cached_extents(
+        cache_key,
+        &cache_manager,
+        "\"etag-v1\"",
+        &[(RANGE_START, RANGE_END)],
+    )
+    .await;
+
+    // The object grew from OBJECT_SIZE to twice that, under a newer version.
+    let grown_size = OBJECT_SIZE * 2;
+    let tail: Vec<u8> = (0..512u32).map(|i| (i % 251) as u8).collect();
+    let grown_etag = "\"etag-grown\"";
+    let stub = StubS3Client::new().with_default(
+        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
+            .with_body(Bytes::from(tail.clone()))
+            .with_header(
+                "content-range",
+                format!(
+                    "bytes {}-{}/{}",
+                    grown_size - 512,
+                    grown_size - 1,
+                    grown_size
+                ),
+            )
+            .with_header("etag", grown_etag)
+            .with_header("last-modified", "Thu, 02 Jan 2025 00:00:00 GMT"),
+    );
+    let client_headers = HashMap::from([
+        ("range".to_string(), "bytes=-512".to_string()),
+        (
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential=T/20250102/us-west-2/s3/aws4_request, \
+                 SignedHeaders={signed_headers}, Signature=x"
+            ),
+        ),
+    ]);
+    let response = HttpProxy::handle_range_request(
+        Method::GET,
+        cache_key.to_string(),
+        "bytes=-512",
+        client_headers,
+        Arc::clone(&cache_manager),
+        Arc::clone(&range_handler),
+        stub.clone().into_trait_object(),
+        "s3.us-west-2.amazonaws.com".to_string(),
+        format!("/{}", cache_key).parse().expect("uri"),
+        Arc::clone(&config),
+        &ResolvedSettings {
+            get_ttl: Duration::ZERO,
+            ..ResolvedSettings::default()
+        },
+        production_current_etag(&cache_manager, cache_key),
+        Arc::clone(&inflight_tracker),
+        None,
+        &None,
+        false,
+        None,
+    )
+    .await
+    .expect("handle_range_request returns Infallible");
+    assert_eq!(
+        body_of(response).await,
+        tail,
+        "the client must receive the true tail"
+    );
+
+    // The cache write commits in the background; wait for its journal entry.
+    let wait = if stub_body_is_cached { 5 } else { 1 };
+    let deadline = std::time::Instant::now() + Duration::from_secs(wait);
+    let ranges = loop {
+        let ranges = range_handler
+            .get_disk_cache_manager()
+            .read()
+            .await
+            .find_pending_journal_ranges(cache_key, 0, grown_size - 1, Some(grown_etag))
+            .await
+            .expect("journal lookup");
+        if !ranges.is_empty() || std::time::Instant::now() > deadline {
+            break ranges;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let extents: Vec<(u64, u64)> = ranges.iter().map(|r| (r.start, r.end)).collect();
+    if !stub_body_is_cached {
+        assert!(
+            extents
+                .iter()
+                .all(|&extent| extent == (grown_size - 512, grown_size - 1)),
+            "nothing may be cached at the stale resolution: {:?}",
+            extents
+        );
+        return;
+    }
+    assert_eq!(
+        extents,
+        vec![(grown_size - 512, grown_size - 1)],
+        "the tail must be cached where S3 said it lives, not at the stale resolution \
+         {}-{}",
+        OBJECT_SIZE - 512,
+        OBJECT_SIZE - 1
+    );
+    let stored = range_handler
+        .get_disk_cache_manager()
+        .read()
+        .await
+        .load_range_data_for_version(&ranges[0], cache_key, grown_etag)
+        .await
+        .expect("load cached tail");
+    assert_eq!(stored, tail);
 }

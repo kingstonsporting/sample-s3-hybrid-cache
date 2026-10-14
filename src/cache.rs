@@ -976,6 +976,7 @@ struct JournalComponents {
     /// Exposed through [`CacheManager::acquire_metadata_lock`] so a publication that
     /// writes a `.meta` directly (multipart completion) is serialised against them.
     lock_manager: Arc<crate::metadata_lock_manager::MetadataLockManager>,
+    confirmed_versions: Arc<crate::disk_cache::ConfirmedVersions>,
 }
 
 /// An evicted range, carrying everything both the accumulator debit and the Remove
@@ -1014,11 +1015,8 @@ struct EvictedRange {
 /// from anything wider — an object's whole `ranges` list, say — charges for files
 /// that were already absent.
 struct RemovedRange {
-    start: u64,
-    end: u64,
-    /// The figure to debit. Always `compressed_size`, for symmetry with the credit
-    /// sites; an on-disk `len()` would drift silently.
-    compressed_size: u64,
+    /// Original metadata, including the file's version and credited size.
+    range_spec: crate::cache_types::RangeSpec,
     /// Absolute path, which is the form `write_eviction_journal_entries` expects.
     bin_path: String,
     /// Evaluated by `is_staged_range_spec` at delete time — the range's own recorded
@@ -1450,6 +1448,7 @@ impl CacheManager {
 
         // Configure metadata I/O limits (cache-metadata-resilience Req 1, 3, 4)
         disk_cache.set_metadata_config(self.max_metadata_file_bytes, self.metadata_io_concurrency);
+        disk_cache.set_metadata_cache(Arc::clone(&self.metadata_cache));
 
         // Configure partial-range commit ratio (crt-conditional-range-caching Req 2)
         disk_cache.set_partial_range_commit_ratio(self.partial_range_commit_ratio);
@@ -1475,6 +1474,7 @@ impl CacheManager {
         let components = self.journal_components();
 
         disk_cache.set_hybrid_metadata_writer(components.hybrid_writer.clone());
+        disk_cache.set_confirmed_versions(components.confirmed_versions.clone());
         // Wire JournalConsolidator to DiskCacheManager for direct size tracking
         // This fixes the size tracking bug where HybridMetadataWriter writes metadata immediately,
         // causing consolidation to see size_delta=0 (range already in metadata)
@@ -1636,6 +1636,7 @@ impl CacheManager {
             hybrid_writer,
             cache_hit_buffer,
             lock_manager,
+            confirmed_versions: Arc::default(),
         }
     }
 
@@ -2307,8 +2308,16 @@ impl CacheManager {
     /// helper so lookup and promotion agree by construction. A mismatch
     /// between them would silently disable the RAM tier for ranges, with no
     /// test failure to surface it (the miss just falls through to disk).
-    pub(crate) fn generate_ram_range_key(cache_key: &str, start: u64, end: u64) -> String {
-        format!("{}:range:{}:{}", cache_key, start, end)
+    ///
+    /// The ETag is part of the key, so a RAM hit can only return the bytes of
+    /// the object version the caller validated.
+    pub(crate) fn generate_ram_range_key(
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        etag: &str,
+    ) -> String {
+        format!("{}:range:{}:{}:{}", cache_key, start, end, etag)
     }
 
     /// Generate cache key with part number and range parameters
@@ -2399,48 +2408,6 @@ impl CacheManager {
                     "Successfully refreshed cache TTL (unified) for key: {}",
                     cache_key
                 );
-            }
-        }
-
-        // Also try old format for backward compatibility
-        if let Some(mut entry) = self.get_cached_response(cache_key).await? {
-            // Apply TTL overrides for consistency - Task 8.3
-            let ttl_path = self.parse_cache_key_for_ttl(cache_key);
-            let effective_head_ttl = self.get_effective_head_ttl(&ttl_path).await;
-            entry.metadata_expires_at = now + effective_head_ttl;
-
-            let lock_acquired = self.acquire_write_lock(cache_key).await?;
-            if !lock_acquired {
-                warn!(
-                    "Could not acquire write lock for old format cache TTL refresh: {}",
-                    cache_key
-                );
-            } else {
-                let metadata_file_path = self.get_new_metadata_file_path(cache_key);
-                let metadata_json = serde_json::to_string_pretty(&entry).map_err(|e| {
-                    ProxyError::CacheError(format!("Failed to serialize metadata: {}", e))
-                })?;
-
-                // Create parent directories for metadata file if they don't exist
-                if let Some(parent) = metadata_file_path.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        warn!("Failed to create metadata directory for TTL refresh: {}", e);
-                    }
-                }
-
-                let temp_metadata_file = metadata_file_path.with_extension("meta.tmp");
-                if let Err(e) = std::fs::write(&temp_metadata_file, metadata_json) {
-                    warn!("Failed to write old format cache TTL refresh: {}", e);
-                } else if let Err(e) = std::fs::rename(&temp_metadata_file, &metadata_file_path) {
-                    warn!("Failed to rename old format cache TTL refresh: {}", e);
-                } else {
-                    debug!(
-                        "Successfully refreshed old format cache TTL for key: {}",
-                        cache_key
-                    );
-                }
-
-                self.release_write_lock(cache_key).await?;
             }
         }
 
@@ -2687,17 +2654,10 @@ impl CacheManager {
                     // (not just evicted through the normal eviction path)
                     if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                         for range_spec in &new_metadata.ranges {
-                            // `subtract_range`, so the dedup entry goes with the bytes.
-                            // This site matters most for that: invalidate-then-re-cache
-                            // of the same range is the ordinary stale-ETag flow, and
-                            // with a plain `subtract` the re-cache credits nothing.
-                            // See `SizeAccumulator::subtract_range`.
-                            consolidator.size_accumulator().subtract_range(
-                                cache_key,
-                                range_spec.start,
-                                range_spec.end,
-                                range_spec.compressed_size,
-                            );
+                            // Release the deleted file's versioned dedup entry.
+                            consolidator
+                                .size_accumulator()
+                                .subtract_range_file(cache_key, range_spec);
                             // Check if write-cached — single shared predicate, so this
                             // subtract cannot disagree with the add sites. Per range,
                             // reading the membership the range recorded when it was
@@ -3255,7 +3215,13 @@ impl CacheManager {
             let uncompressed_size = compression_result.original_size;
 
             // Write range data to .tmp file then atomically rename
-            let range_file_path = self.get_new_range_file_path(&cache_key, start, end);
+            let range_file_path = crate::disk_cache::versioned_range_file_path(
+                self.get_new_range_file_path(&cache_key, start, end),
+                &cache_key,
+                start,
+                end,
+                &metadata.object_metadata.etag,
+            );
             let range_tmp_path = range_file_path.with_extension("bin.tmp");
 
             // Ensure ranges directory exists
@@ -3742,7 +3708,8 @@ impl CacheManager {
         range_handler: &crate::range_handler::RangeHandler,
     ) -> Result<(Bytes, bool)> {
         // Generate a unique cache key for this specific range
-        let range_cache_key = Self::generate_ram_range_key(cache_key, range.start, range.end);
+        let range_cache_key =
+            Self::generate_ram_range_key(cache_key, range.start, range.end, &range.etag);
 
         // First tier: Check RAM cache if enabled
         if self.ram_cache_enabled {
@@ -5085,9 +5052,9 @@ impl CacheManager {
                     }
 
                     // Batch evict all selected ranges for this object
-                    match self.batch_evict_ranges(&cache_key, &ranges).await {
-                        Ok((bytes_freed, deleted_paths, unlinked_extents)) => {
-                            Some((cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents))
+                    match self.batch_evict_range_files(&cache_key, &ranges).await {
+                        Ok((bytes_freed, deleted_paths, unlinked_ranges)) => {
+                            Some((cache_key, ranges, bytes_freed, deleted_paths, unlinked_ranges))
                         }
                         Err(e) => {
                             // Requirement 7.4: Log errors with cache_key and failure reason
@@ -5134,50 +5101,27 @@ impl CacheManager {
                 break;
             }
 
-            let (cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents) = result;
+            let (cache_key, ranges, bytes_freed, deleted_paths, unlinked_ranges) = result;
             total_bytes_freed += bytes_freed;
 
-            // R7.2: build the accounting list from the extents that ACTUALLY left the
-            // disk, never from `ranges` — the candidate list.
-            //
-            // Iterating `ranges` here debited every candidate, including one whose
-            // `.bin` unlink failed, while `bytes_freed` (which does honour the per-file
-            // outcome) was spent only on the early-exit total and the `debug!` below.
-            // The result was a phantom debit: bytes removed from the accumulator that
-            // are still on the volume, leaving the recorded total SHORT of the disk —
-            // undershoot, the direction that silently over-admits.
-            //
-            // Matched on the `(start, end)` extent rather than on the `.bin` path. The
-            // paths are derived twice from different inputs — a candidate's
-            // `bin_file_path` is `ranges/` joined with the `RangeSpec`'s recorded
-            // relative path, while the unlink target is re-derived from the cache key
-            // by `get_new_range_file_path` — so comparing them would make the debit
-            // depend on two derivations agreeing, and a mismatch would silently debit
-            // NOTHING. The extent is the identity `batch_delete_ranges` itself selects
-            // on, so it cannot drift.
-            //
-            // Note `total_ranges_evicted` also moves to the unlinked count: it feeds
-            // the operator-facing `ranges_evicted=` summary, which should not claim a
-            // range that is still there.
-            //
-            // Spec: cache-eviction-at-scale. Requirements: 7.2
-            let unlinked: std::collections::HashSet<(u64, u64)> =
-                unlinked_extents.into_iter().collect();
-            let mut skipped_ranges = 0usize;
-            for range in &ranges {
-                if !unlinked.contains(&(range.range_start, range.range_end)) {
-                    skipped_ranges += 1;
-                    continue;
-                }
+            // Account the files actually removed from current metadata. The
+            // discovery candidates may belong to a prior version at these offsets.
+            let skipped_ranges = ranges.len().saturating_sub(unlinked_ranges.len());
+            for range in unlinked_ranges {
                 total_ranges_evicted += 1;
                 evicted_ranges_for_journal.push(EvictedRange {
                     cache_key: cache_key.clone(),
-                    start: range.range_start,
-                    end: range.range_end,
-                    size: range.size,
-                    bin_path: range.bin_file_path.to_string_lossy().to_string(),
+                    start: range.start,
+                    end: range.end,
+                    size: range.compressed_size,
+                    bin_path: self
+                        .cache_dir
+                        .join("ranges")
+                        .join(&range.file_path)
+                        .to_string_lossy()
+                        .to_string(),
                     compressed_size: range.compressed_size,
-                    is_write_cached: range.is_write_cached,
+                    is_write_cached: false,
                     staged: range.staged,
                 });
             }
@@ -5228,17 +5172,19 @@ impl CacheManager {
             if let Some(consolidator) = self.journal_consolidator.read().await.as_ref() {
                 // Decrement accumulator for each evicted range using compressed_size
                 for evicted in &evicted_ranges_for_journal {
-                    // `subtract_range` rather than `subtract`, so the range's dedup
-                    // entry leaves with its bytes. Otherwise an evicted range that is
-                    // later re-cached is deduplicated on the way back in and credits
-                    // nothing, leaving the total short — undershoot, the direction that
-                    // over-admits. See `SizeAccumulator::subtract_range`.
-                    consolidator.size_accumulator().subtract_range(
-                        &evicted.cache_key,
+                    // Accounting uses the extent, original filename and credited
+                    // size; compression fields are not consulted for this debit.
+                    let range_spec = crate::cache_types::RangeSpec::new(
                         evicted.start,
                         evicted.end,
+                        evicted.bin_path.clone(),
+                        CompressionAlgorithm::None,
                         evicted.compressed_size,
+                        evicted.end - evicted.start + 1,
                     );
+                    consolidator
+                        .size_accumulator()
+                        .subtract_range_file(&evicted.cache_key, &range_spec);
                     // Debit the write tier only for a range that belongs to it, taken
                     // from the membership the range recorded when it was credited and
                     // falling back to the object flag only for a range written before
@@ -5766,13 +5712,8 @@ impl CacheManager {
     /// * `Ok((bytes_freed, deleted_paths, unlinked_extents))` on success
     ///   - `bytes_freed`: Total bytes freed from range files that were actually unlinked
     ///   - `deleted_paths`: Paths of all deleted files (for directory cleanup)
-    ///   - `unlinked_extents`: `(start, end)` of ranges whose `.bin` existed and was
-    ///     unlinked cleanly. **The only list the caller's accounting may be built
-    ///     from** — the candidate list it passed in includes ranges whose unlink
-    ///     failed, and debiting those leaves the accumulator short of what is on
-    ///     disk. Forwarded verbatim from
-    ///     [`crate::disk_cache::BatchRangeDeletion::unlinked_extents`]; see that
-    ///     field for why an already-absent file is excluded too.
+    ///   - `unlinked_extents`: `(start, end)` of files that existed and were removed.
+    ///     Failed unlinks and files already absent are excluded.
     ///     Spec: cache-eviction-at-scale. Requirements: 7.2
     /// * `Err` if lock acquisition fails or eviction encounters a critical error
     ///
@@ -5791,6 +5732,23 @@ impl CacheManager {
         cache_key: &str,
         ranges: &[RangeEvictionCandidate],
     ) -> Result<(u64, Vec<PathBuf>, Vec<(u64, u64)>)> {
+        let (bytes_freed, deleted_paths, unlinked_ranges) =
+            self.batch_evict_range_files(cache_key, ranges).await?;
+        let unlinked_extents = unlinked_ranges
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect();
+        Ok((bytes_freed, deleted_paths, unlinked_extents))
+    }
+
+    /// Return the files actually removed, including the current version's path,
+    /// measured size and staging membership. Internal accounting must use these
+    /// rather than candidates collected before an overwrite.
+    async fn batch_evict_range_files(
+        &self,
+        cache_key: &str,
+        ranges: &[RangeEvictionCandidate],
+    ) -> Result<(u64, Vec<PathBuf>, Vec<crate::cache_types::RangeSpec>)> {
         if ranges.is_empty() {
             debug!("No ranges to evict for cache_key={}", cache_key);
             return Ok((0, Vec::new(), Vec::new()));
@@ -5851,8 +5809,7 @@ impl CacheManager {
 
         // Call DiskCacheManager.batch_delete_ranges()
         // This handles file deletion and the metadata update, and reports which extents
-        // actually left the disk (`unlinked_extents`) separately from which were
-        // requested — the distinction R7.2 depends on.
+        // actually left the disk separately from discovery candidates.
         let deletion = match disk_cache
             .batch_delete_ranges(cache_key, &ranges_to_delete)
             .await
@@ -5922,7 +5879,7 @@ impl CacheManager {
         Ok((
             deletion.bytes_freed,
             deletion.deleted_paths,
-            deletion.unlinked_extents,
+            deletion.unlinked_ranges,
         ))
     }
 
@@ -6030,20 +5987,6 @@ impl CacheManager {
     /// See [`strip_known_cache_key_suffixes`] for the suffix grammar.
     fn extract_path_from_cache_key(cache_key: &str) -> String {
         strip_known_cache_key_suffixes(cache_key)
-    }
-
-    /// Check if the given ranges represent a full object (single range from 0 to content_length-1)
-    /// Requirement 2.9: Helper to detect partial vs full object caching
-    fn is_full_object_cached(
-        ranges: &[crate::cache_types::RangeSpec],
-        content_length: u64,
-    ) -> bool {
-        if ranges.len() != 1 {
-            return false;
-        }
-
-        let range = &ranges[0];
-        range.start == 0 && range.end == content_length - 1
     }
 
     /// Decompress range data specifically
@@ -7502,7 +7445,7 @@ impl CacheManager {
                 cache_key,
                 start,
                 end,
-                None,
+                Some(&metadata),
                 crate::cache_types::RangeLookupPurpose::FreshServe,
             )
             .await
@@ -7543,7 +7486,10 @@ impl CacheManager {
             );
 
             // Load range data from disk - Handle cached part read failures (Requirement 11.3)
-            let range_data = match disk_cache.load_range_data(range_spec).await {
+            let range_data = match disk_cache
+                .load_range_data_for_version(range_spec, cache_key, &metadata.object_metadata.etag)
+                .await
+            {
                 Ok(data) => data,
                 Err(e) => {
                     // Handle cached part read failures - log and fall back to S3 (Requirement 11.3)
@@ -8454,6 +8400,10 @@ impl CacheManager {
             )));
         }
 
+        // Hold the same per-key lock as range publication and consolidation
+        // across both the update and create paths.
+        let _lock = self.acquire_metadata_lock(cache_key).await?;
+
         // Store in the unified NewCacheMetadata format
         // Try to read existing metadata from disk instead of using exists() check.
         // On NFS, exists() can return false due to attribute caching even when the file
@@ -8539,7 +8489,9 @@ impl CacheManager {
     /// without firing on entries this release itself writes. Nothing is lost:
     /// the part count survives as the typed `ObjectMetadata::parts_count` field,
     /// which `store_part_as_range` populates from this same header.
-    fn strip_response_scoped_headers(headers: &HashMap<String, String>) -> HashMap<String, String> {
+    pub(crate) fn strip_response_scoped_headers(
+        headers: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
         headers
             .iter()
             .filter(|(k, _)| {
@@ -8584,7 +8536,8 @@ impl CacheManager {
         })
     }
 
-    /// Update HEAD fields in an existing NewCacheMetadata file
+    /// Update HEAD fields in an existing NewCacheMetadata file.
+    /// The caller holds the per-key metadata lock.
     async fn update_metadata_head_fields(
         &self,
         cache_key: &str,
@@ -8592,11 +8545,6 @@ impl CacheManager {
         legacy_metadata: &CacheMetadata,
     ) -> Result<crate::cache_types::NewCacheMetadata> {
         let metadata_path = self.get_new_metadata_file_path(cache_key);
-
-        // Read-modify-write under the per-key metadata lock: a concurrent 304
-        // revalidation, consolidation, or multipart publication must not be
-        // overwritten by this HEAD refresh (or vice versa).
-        let _lock = self.acquire_metadata_lock(cache_key).await?;
 
         // Read existing metadata
         let mut metadata = self
@@ -8616,7 +8564,6 @@ impl CacheManager {
 
         // Detect object change from HEAD response before overwriting fields
         let etag_changed = !legacy_metadata.etag.is_empty()
-            && !metadata.object_metadata.etag.is_empty()
             && metadata.object_metadata.etag != legacy_metadata.etag;
 
         let size_changed = legacy_metadata.content_length > 0
@@ -8630,7 +8577,24 @@ impl CacheManager {
                 etag_changed, metadata.object_metadata.etag, legacy_metadata.etag,
                 size_changed, metadata.object_metadata.content_length, legacy_metadata.content_length
             );
-            // Clear cached ranges — they belong to the old object version
+            self.invalidate_ram_ranges(cache_key).await?;
+            let (removed, failed) = self.remove_range_files(
+                cache_key,
+                &metadata.ranges,
+                metadata.object_metadata.is_write_cached,
+            );
+            self.debit_removed_ranges(cache_key, &removed).await;
+            if failed > 0 {
+                // Keep the old metadata's identity and cleanup ownership until
+                // every old file is gone. Never attach failed deletions to the
+                // new object version.
+                self.metadata_cache.invalidate(cache_key).await;
+                return Err(ProxyError::CacheError(format!(
+                    "HEAD version refresh could not remove {} old range file(s) for {}",
+                    failed, cache_key
+                )));
+            }
+            // All old files have been removed or were already absent.
             metadata.ranges.clear();
             // Expire immediately so the next GET fetches fresh data
             metadata.expires_at = std::time::SystemTime::now();
@@ -9221,12 +9185,18 @@ impl CacheManager {
     }
     /// Load range data from RAM cache, returning the decompressed data if found.
     /// Records hit/miss statistics. Returns None on miss or if RAM cache is disabled.
-    pub fn get_range_from_ram_cache(&self, cache_key: &str, start: u64, end: u64) -> Option<Bytes> {
+    pub fn get_range_from_ram_cache(
+        &self,
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        etag: &str,
+    ) -> Option<Bytes> {
         if !self.ram_cache_enabled {
             return None;
         }
 
-        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end);
+        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end, etag);
 
         let ram_read = {
             if let Some(ram_cache) = &self.ram_cache {
@@ -9307,7 +9277,7 @@ impl CacheManager {
             return false;
         }
 
-        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end);
+        let range_cache_key = Self::generate_ram_range_key(cache_key, start, end, &etag);
 
         if frame_data.len() as u64 > self.max_ram_cache_size {
             debug!(
@@ -9641,7 +9611,7 @@ impl CacheManager {
         // sink retains the capacity reservation until it drops at the end of this
         // function — after the metadata write below — matching the buffered path's
         // reservation lifetime.
-        let (mut range_spec, range_already_existed) = match sink.finalize() {
+        let (mut range_spec, range_already_existed) = match sink.finalize(&etag) {
             Ok(pair) => pair,
             Err(e) => {
                 if lock_acquired {
@@ -9935,12 +9905,9 @@ impl CacheManager {
             return;
         };
 
-        consolidator.size_accumulator().add_range(
-            cache_key,
-            range_spec.start,
-            range_spec.end,
-            range_spec.compressed_size,
-        );
+        consolidator
+            .size_accumulator()
+            .add_range_file(cache_key, range_spec);
         // Reads the membership its callers recorded on the range before writing the
         // `.meta`, falling back to the object flag only for a range that predates the
         // field. So the credit is charged against exactly the tier the persisted range
@@ -10010,9 +9977,7 @@ impl CacheManager {
             }
             match std::fs::remove_file(&range_file_path) {
                 Ok(()) => removed.push(RemovedRange {
-                    start: range_spec.start,
-                    end: range_spec.end,
-                    compressed_size: range_spec.compressed_size,
+                    range_spec: range_spec.clone(),
                     bin_path: range_file_path.to_string_lossy().to_string(),
                     // Classified from the `.meta` this call read, against the same
                     // shared predicate every add and subtract site uses — per range,
@@ -10063,7 +10028,8 @@ impl CacheManager {
     /// Mirrors `WriteCacheManager::evict_write_cached_object` and read-tier
     /// eviction's Step 5, so all the debit sites agree:
     ///
-    /// - `subtract` unconditionally — the bytes left the disk either way.
+    /// - `subtract_range_file` unconditionally, releasing the deleted version's
+    ///   dedup entry as well as debiting its bytes.
     /// - `subtract_write_cache` only where
     ///   [`crate::cache_types::is_staged_range_spec`]
     ///   held at delete time. This is also the guard against double-debiting a
@@ -10076,20 +10042,14 @@ impl CacheManager {
     /// - `Remove` journal entries so the other instances converge, and so an
     ///   unconsolidated `Add` for one of these ranges cannot resurrect a reference to
     ///   a `.bin` that is gone.
-    /// - No `decrement_cached_objects`. Both callers overwrite the `.meta` rather than
-    ///   deleting it, so the object still exists; that debit belongs to eviction.
+    /// - No `decrement_cached_objects`. Callers refresh or replace the `.meta`
+    ///   rather than deleting it, so that debit belongs to eviction.
     ///
     /// # Why this does not flush the accumulator, when eviction does
     ///
-    /// `evict_write_cached_object` flushes immediately, reasoning that the files are
-    /// already gone so an unflushed debit is lost outright on a crash. Deliberately
-    /// not copied here, for two reasons. These are PUT-path calls rather than a cold
-    /// eviction pass, so a delta file per overwrite is per-request shared-storage I/O.
-    /// More importantly the debit is **paired** with a credit a few lines later that
-    /// does not flush either: flushing one and not the other would make a crash window
-    /// that loses only the credit, biasing `write_cache_size` toward undershoot — the
-    /// direction that silently over-admits. Losing both together nets to zero, and the
-    /// periodic flush closes the window within `consolidation_interval` anyway.
+    /// Replacement writes pair this debit with a later credit, and both remain
+    /// pending until the periodic accumulator flush. HEAD invalidations leave only
+    /// a debit pending. A validation scan repairs any delta lost before that flush.
     ///
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
     async fn debit_removed_ranges(&self, cache_key: &str, removed: &[RemovedRange]) {
@@ -10111,22 +10071,15 @@ impl CacheManager {
         let mut total_debited = 0u64;
         let mut staged_debited = 0u64;
         for range in removed {
-            // `subtract_range`, not `subtract`: the range's dedup entry has to go with
-            // its bytes, or the re-publish a few lines later is deduplicated away and
-            // the total ends up short by one copy instead of long by one. Measured —
-            // see the method's doc.
-            consolidator.size_accumulator().subtract_range(
-                cache_key,
-                range.start,
-                range.end,
-                range.compressed_size,
-            );
-            total_debited += range.compressed_size;
+            consolidator
+                .size_accumulator()
+                .subtract_range_file(cache_key, &range.range_spec);
+            total_debited += range.range_spec.compressed_size;
             if range.counts_as_staged {
                 consolidator
                     .size_accumulator()
-                    .subtract_write_cache(range.compressed_size);
-                staged_debited += range.compressed_size;
+                    .subtract_write_cache(range.range_spec.compressed_size);
+                staged_debited += range.range_spec.compressed_size;
             }
         }
 
@@ -10137,9 +10090,9 @@ impl CacheManager {
                     .map(|range| {
                         (
                             cache_key.to_string(),
-                            range.start,
-                            range.end,
-                            range.compressed_size,
+                            range.range_spec.start,
+                            range.range_spec.end,
+                            range.range_spec.compressed_size,
                             range.bin_path.clone(),
                         )
                     })
@@ -10289,8 +10242,7 @@ impl CacheManager {
         store_result
     }
 
-    /// Store full object as range using new range storage architecture
-    /// This is a helper method for write cache that stores PUT body as range 0 to content_length-1
+    /// Store a buffered full-object response as a single cached range.
     /// Requirements: 1.1, 1.2, 1.3, 2.9
     async fn store_full_object_as_range_new(
         &self,
@@ -10334,16 +10286,23 @@ impl CacheManager {
             return self.store_new_metadata(&metadata).await;
         }
 
-        // Requirements 1.1, 1.5, 3.5: Check for existing partial ranges and remove them before storing full object
-        // This ensures we don't have both partial ranges and full object cached simultaneously
-        // Use proper locking for concurrent operations
+        let start = 0u64;
+        let end = content_length - 1;
+        let range_file_path = crate::disk_cache::versioned_range_file_path(
+            self.get_new_range_file_path(cache_key, start, end),
+            cache_key,
+            start,
+            end,
+            &object_metadata.etag,
+        );
+
+        // Remove superseded files before their metadata ownership is replaced.
         let lock_acquired = self.acquire_write_lock(cache_key).await?;
         if !lock_acquired {
             warn!(
-                "Could not acquire write lock for full object caching: cache_key={}, skipping range cleanup",
+                "Could not acquire write lock for full object caching: cache_key={}",
                 cache_key
             );
-            // Continue without cleanup - the store operation will still work
         } else {
             debug!(
                 "Acquired write lock for full object caching: cache_key={}",
@@ -10353,67 +10312,57 @@ impl CacheManager {
 
         let metadata_file_path = self.get_new_metadata_file_path(cache_key);
         if metadata_file_path.exists() {
-            debug!(
-                "Checking for existing partial ranges for key: {}",
-                cache_key
-            );
+            debug!("Checking for superseded ranges for key: {}", cache_key);
 
-            // Read existing metadata to check for partial ranges
+            // Read the file ownership that will be replaced by this response.
             match std::fs::read_to_string(&metadata_file_path) {
                 Ok(content) => {
                     match serde_json::from_str::<NewCacheMetadata>(&content) {
                         Ok(existing_metadata) => {
-                            // Check if existing ranges are partial (not covering the full object)
-                            let has_partial_ranges = !existing_metadata.ranges.is_empty()
-                                && !Self::is_full_object_cached(
-                                    &existing_metadata.ranges,
-                                    content_length,
-                                );
-
-                            // Reported, not branched on. It used to gate the removal
-                            // below, and the two arms had been transposed: the
-                            // `etag_changed` arm logged "invalidating N partial ranges"
-                            // and removed nothing, while the `!etag_changed` arm logged
-                            // "keeping N partial ranges" and removed them all. `git
-                            // blame` explains it — the removal loop predates the ETag
-                            // condition (1603206, 2025-11-26, where it was
-                            // unconditional) and the condition was retrofitted around it
-                            // (9cd5444, 2025-12-12) with the loop left under the wrong
-                            // arm.
-                            //
-                            // The condition is gone rather than corrected, because the
-                            // ETag cannot decide this: the `.meta` written at the end of
-                            // this function replaces `ranges` wholesale with the single
-                            // new full-object range, so these partial ranges are
-                            // dereferenced either way. Keeping their `.bin` files back
-                            // would orphan them on disk with nothing referencing them —
-                            // which is what the transposed `etag_changed` arm was doing
-                            // for every changed object.
+                            // The new metadata will reference only its target file.
+                            // Preserve that file on a repeat store, but remove every
+                            // other range before dropping its cleanup ownership.
+                            let superseded_ranges: Vec<_> = existing_metadata
+                                .ranges
+                                .iter()
+                                .filter(|range| {
+                                    self.cache_dir.join("ranges").join(&range.file_path)
+                                        != range_file_path
+                                })
+                                .cloned()
+                                .collect();
                             let etag_changed =
                                 existing_metadata.object_metadata.etag != object_metadata.etag;
 
-                            if has_partial_ranges {
+                            if !superseded_ranges.is_empty() {
                                 info!(
-                                    "Full object caching: superseding {} partial range(s) for key: {}, etag_changed={}, old_etag={}, new_etag={}",
-                                    existing_metadata.ranges.len(),
+                                    "Full object caching: superseding {} range(s) for key: {}, etag_changed={}, old_etag={}, new_etag={}",
+                                    superseded_ranges.len(),
                                     cache_key,
                                     etag_changed,
                                     existing_metadata.object_metadata.etag,
                                     object_metadata.etag
                                 );
 
-                                // Remove the dereferenced range files and debit for the
-                                // ones that really went. A file that was already absent
-                                // is neither removed nor debited — the old loop counted
-                                // it as removed, which inflated the figure it logged.
-                                // Spec: write-cache-accounting-and-eviction.
-                                // Requirements: 1.1, 6.2
                                 let (removed, failed) = self.remove_range_files(
                                     cache_key,
-                                    &existing_metadata.ranges,
+                                    &superseded_ranges,
                                     existing_metadata.object_metadata.is_write_cached,
                                 );
                                 self.debit_removed_ranges(cache_key, &removed).await;
+                                self.metadata_cache.invalidate(cache_key).await;
+                                if failed > 0 {
+                                    // Keep old metadata owning the failed files.
+                                    let ram_result = self.invalidate_ram_ranges(cache_key).await;
+                                    if lock_acquired {
+                                        let _ = self.release_write_lock(cache_key).await;
+                                    }
+                                    ram_result?;
+                                    return Err(ProxyError::CacheError(format!(
+                                        "Full object refresh could not remove {} old range file(s) for {}",
+                                        failed, cache_key
+                                    )));
+                                }
 
                                 info!(
                                     "Full object range replacement completed: key={}, removed_ranges={}, failed_removals={}",
@@ -10445,10 +10394,6 @@ impl CacheManager {
             }
         }
 
-        // Store as range 0 to content_length-1
-        let start = 0u64;
-        let end = content_length - 1;
-
         info!(
             "Storing full object as range {}-{} for key: {} ({} bytes)",
             start, end, cache_key, content_length
@@ -10478,8 +10423,8 @@ impl CacheManager {
         );
 
         // Write range data to .tmp file then atomically rename
-        let range_file_path = self.get_new_range_file_path(cache_key, start, end);
-        let range_tmp_path = range_file_path.with_extension("bin.tmp");
+        let range_tmp_path =
+            range_file_path.with_file_name(format!("{}.bin.tmp", uuid::Uuid::new_v4()));
 
         // Ensure ranges directory exists
         if let Some(parent) = range_file_path.parent() {
@@ -10516,8 +10461,7 @@ impl CacheManager {
             )));
         }
 
-        // Create range spec with relative path from ranges directory
-        // Must use full relative path (bucket/XX/YYY/object_0-1023.bin), not just filename
+        // Record the exact relative filename used by subsequent reads.
         let ranges_dir = self.cache_dir.join("ranges");
         let range_file_relative_path = range_file_path
             .strip_prefix(&ranges_dir)
@@ -12878,14 +12822,15 @@ impl WriteCacheRangeSink {
     /// It used to discard the flag, which is how the credit came to be missing
     /// entirely: with nothing to gate, there was nothing to gate.
     /// Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
-    pub(crate) fn finalize(&mut self) -> Result<(crate::cache_types::RangeSpec, bool)> {
+    pub(crate) fn finalize(&mut self, etag: &str) -> Result<(crate::cache_types::RangeSpec, bool)> {
         let writer = self.writer.take().ok_or_else(|| {
             ProxyError::CacheError(format!(
                 "WriteCacheRangeSink::finalize called after commit/discard/finalize: key={}",
                 self.cache_key
             ))
         })?;
-        self.disk_cache.finalize_incremental_range(writer, None)
+        self.disk_cache
+            .finalize_incremental_range(writer, None, etag)
     }
 
     /// Finalize the range: flush any residual batch, validate the written length,
@@ -13505,10 +13450,11 @@ mod cache_key_sanitization_tests {
                                                 if found_range.is_some() {
                                                     // Verify the range file exists
                                                     let range_file_path = disk_cache
-                                                        .get_new_range_file_path(
+                                                        .get_versioned_range_file_path(
                                                             cache_key,
                                                             parsed_start,
                                                             parsed_end,
+                                                            &object_metadata.etag,
                                                         );
 
                                                     if range_file_path.exists() {
@@ -13599,7 +13545,12 @@ mod cache_key_sanitization_tests {
             match store_result {
                 Ok(()) => {
                     // Verify the range file exists
-                    let range_file_path = disk_cache.get_new_range_file_path(cache_key, start, end);
+                    let range_file_path = disk_cache.get_versioned_range_file_path(
+                        cache_key,
+                        start,
+                        end,
+                        &object_metadata.etag,
+                    );
                     if !range_file_path.exists() {
                         return TestResult::failed();
                     }
@@ -13816,10 +13767,11 @@ mod cache_key_sanitization_tests {
                         }
 
                         // Verify the range file still exists and has correct content
-                        let range_file_path = disk_cache.get_new_range_file_path(
+                        let range_file_path = disk_cache.get_versioned_range_file_path(
                             cache_key,
                             *original_start,
                             *original_end,
+                            &initial_metadata.etag,
                         );
 
                         if !range_file_path.exists() {
@@ -15304,17 +15256,17 @@ mod eviction_aggregation_tests {
     /// aggregated `total_bytes_freed` SHALL equal the sum of all `bytes_freed_i`, and
     /// `total_ranges_evicted` SHALL equal the sum of all `ranges_count_i`.
     ///
-    /// This tests the aggregation loop in `perform_eviction_with_lock()` that collects
-    /// results from parallel object processing via `buffer_unordered`.
+    /// This checks the arithmetic of aggregating per-object counts and bytes. The
+    /// actual file identity and tier are verified by the eviction integration tests.
     ///
     /// # The precondition is load-bearing (R7.2)
     ///
-    /// This is a shadow re-implementation of that loop, not the loop itself, so it
-    /// cannot detect drift on its own — and the loop has since changed underneath it.
+    /// This is a model of the count arithmetic, not the production loop, so it
+    /// cannot detect file-identity or tier-attribution errors.
     /// `total_ranges_evicted` now counts ranges whose `.bin` actually left the disk
     /// rather than candidates, so the unqualified form of this property — "the total
     /// equals the candidate count" — is **no longer true of the real loop** whenever an
-    /// unlink fails. The shadow below therefore models the `unlinked` filter explicitly
+    /// unlink fails. The model below therefore models the `unlinked` filter explicitly
     /// and the fixture makes every unlink succeed, which is the case in which the sums
     /// do still hold.
     ///
@@ -15339,7 +15291,7 @@ mod eviction_aggregation_tests {
             .map(|&(bytes, ranges)| (bytes as u64, ranges))
             .collect();
 
-        // Build simulated object_results matching the shape in perform_eviction_with_lock:
+        // Build simulated counts and extents for the arithmetic property:
         // Vec<Option<(cache_key, ranges, bytes_freed, deleted_paths, unlinked_extents)>>
         // Some represents a successful eviction, None represents a skipped/failed object.
         // Every candidate extent also appears in `unlinked_extents`, which is the
@@ -15369,7 +15321,7 @@ mod eviction_aggregation_tests {
             })
             .collect();
 
-        // Run the same aggregation logic as perform_eviction_with_lock, including the
+        // Run the aggregation arithmetic, including the
         // R7.2 narrowing — a candidate counts only if its extent was unlinked.
         let mut total_bytes_freed: u64 = 0;
         let mut total_ranges_evicted: u64 = 0;
@@ -15834,10 +15786,10 @@ mod ram_cache_range_property_tests {
             let etag = format!("\"etag-{}\"", etag_seed);
 
             // Promote range data to RAM cache (verbatim, via the live frame path)
-            promote_raw(&cache_manager, &cache_key, start, end, &data, etag);
+            promote_raw(&cache_manager, &cache_key, start, end, &data, etag.clone());
 
             // Look up the range from RAM cache
-            match cache_manager.get_range_from_ram_cache(&cache_key, start, end) {
+            match cache_manager.get_range_from_ram_cache(&cache_key, start, end, &etag) {
                 Some(retrieved_data) => {
                     if retrieved_data == data {
                         TestResult::passed()
@@ -15895,7 +15847,7 @@ mod ram_cache_range_property_tests {
 
             // Path 2: get_range_from_ram_cache — verbatim, byte-exact.
             let via_get = cache_manager
-                .get_range_from_ram_cache(cache_key, start, end)
+                .get_range_from_ram_cache(cache_key, start, end, "\"legacy-etag\"")
                 .expect("None-tagged range should be a RAM hit");
             assert_eq!(
                 via_get, raw,
@@ -15984,15 +15936,23 @@ mod ram_cache_range_property_tests {
             // Page's bounds, then slices the client's narrower sub-range from
             // the returned buffer) — never a lookup keyed on the client's own
             // sub-range.
-            let sub_range_1 =
-                cache_manager.get_range_from_ram_cache(cache_key, page_start, page_end);
+            let sub_range_1 = cache_manager.get_range_from_ram_cache(
+                cache_key,
+                page_start,
+                page_end,
+                "\"page-etag\"",
+            );
             assert!(
                 sub_range_1.is_some(),
                 "page-keyed lookup (standing in for a sub-page hit) must be a RAM hit"
             );
             assert_eq!(sub_range_1.unwrap(), page_data);
-            let sub_range_2 =
-                cache_manager.get_range_from_ram_cache(cache_key, page_start, page_end);
+            let sub_range_2 = cache_manager.get_range_from_ram_cache(
+                cache_key,
+                page_start,
+                page_end,
+                "\"page-etag\"",
+            );
             assert!(
                 sub_range_2.is_some(),
                 "a second sub-page hit must also resolve against the same cached Page"
@@ -16065,7 +16025,8 @@ mod ram_cache_range_property_tests {
             promote_raw(&cache_manager, &cache_key, start, end, &data, etag.clone());
 
             // Inspect the stored RamCacheEntry directly via the sharded RAM cache.
-            let range_cache_key = CacheManager::generate_ram_range_key(&cache_key, start, end);
+            let range_cache_key =
+                CacheManager::generate_ram_range_key(&cache_key, start, end, &etag);
             let ram_read = if let Some(rc) = &cache_manager.ram_cache {
                 rc.get(&range_cache_key).await
             } else {
@@ -16098,7 +16059,6 @@ mod ram_cache_range_property_tests {
             start: u16,
             end: u16,
             data: Vec<u8>,
-            etag_seed: u8,
         },
         Get {
             key_idx: u8,
@@ -16121,13 +16081,11 @@ mod ram_cache_range_property_tests {
                 let data: Vec<u8> = (0..data_len)
                     .map(|_| quickcheck::Arbitrary::arbitrary(g))
                     .collect();
-                let etag_seed: u8 = quickcheck::Arbitrary::arbitrary(g);
                 CacheOp::Promote {
                     key_idx,
                     start,
                     end,
                     data,
-                    etag_seed,
                 }
             } else {
                 CacheOp::Get {
@@ -16191,12 +16149,12 @@ mod ram_cache_range_property_tests {
                         start,
                         end,
                         data,
-                        etag_seed,
                     } => {
                         let key = key_pool[(*key_idx as usize) % key_pool.len()];
                         let s = *start as u64;
                         let e = s + (*end as u64); // ensure end >= start
-                        let etag = format!("\"etag-{}\"", etag_seed);
+                                                   // One version, so stats are compared over hits that can occur.
+                        let etag = "\"etag\"".to_string();
                         promote_raw(&cache_manager, key, s, e, data, etag);
                     }
                     CacheOp::Get {
@@ -16207,7 +16165,7 @@ mod ram_cache_range_property_tests {
                         let key = key_pool[(*key_idx as usize) % key_pool.len()];
                         let s = *start as u64;
                         let e = s + (*end as u64); // ensure end >= start
-                        match cache_manager.get_range_from_ram_cache(key, s, e) {
+                        match cache_manager.get_range_from_ram_cache(key, s, e, "\"etag\"") {
                             Some(_) => expected_hits += 1,
                             None => expected_misses += 1,
                         }
@@ -16403,9 +16361,9 @@ mod ram_cache_range_unit_tests {
         let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
         let etag = "\"abc123\"".to_string();
 
-        promote_raw(&cm, cache_key, start, end, &data, etag);
+        promote_raw(&cm, cache_key, start, end, &data, etag.clone());
 
-        let result = cm.get_range_from_ram_cache(cache_key, start, end);
+        let result = cm.get_range_from_ram_cache(cache_key, start, end, &etag);
         assert!(
             result.is_some(),
             "Expected data from RAM cache after promotion"
@@ -16428,9 +16386,16 @@ mod ram_cache_range_unit_tests {
         let data = vec![0xFFu8; (max_size + 1) as usize]; // 1 byte over limit
         let etag = "\"big\"".to_string();
 
-        promote_raw(&cm, cache_key, 0, data.len() as u64 - 1, &data, etag);
+        promote_raw(
+            &cm,
+            cache_key,
+            0,
+            data.len() as u64 - 1,
+            &data,
+            etag.clone(),
+        );
 
-        let result = cm.get_range_from_ram_cache(cache_key, 0, data.len() as u64 - 1);
+        let result = cm.get_range_from_ram_cache(cache_key, 0, data.len() as u64 - 1, &etag);
         assert!(
             result.is_none(),
             "Oversized range must not be promoted to RAM cache"
@@ -16448,10 +16413,10 @@ mod ram_cache_range_unit_tests {
         let etag = "\"disabled\"".to_string();
 
         // Promote should silently do nothing
-        promote_raw(&cm, cache_key, 0, 4, &data, etag);
+        promote_raw(&cm, cache_key, 0, 4, &data, etag.clone());
 
         // Get should return None
-        let result = cm.get_range_from_ram_cache(cache_key, 0, 4);
+        let result = cm.get_range_from_ram_cache(cache_key, 0, 4, &etag);
         assert!(result.is_none(), "RAM cache disabled: get must return None");
 
         // Stats should also reflect disabled state
@@ -16601,7 +16566,7 @@ mod ram_promotion_frame_property_tests {
 
             // Inspect the RAM entry directly to verify it mirrors the on-disk frame.
             let range_cache_key =
-                CacheManager::generate_ram_range_key(cache_key, range.start, range.end);
+                CacheManager::generate_ram_range_key(cache_key, range.start, range.end, &range.etag);
             let ram_read = cache_manager
                 .ram_cache
                 .as_ref()
@@ -16699,8 +16664,12 @@ mod ram_promotion_frame_property_tests {
             assert!(!first_is_ram_hit, "first read must be a disk hit");
             assert_eq!(first_data, data, "disk-hit read-back must be byte-exact");
 
-            let range_cache_key =
-                CacheManager::generate_ram_range_key(cache_key, range.start, range.end);
+            let range_cache_key = CacheManager::generate_ram_range_key(
+                cache_key,
+                range.start,
+                range.end,
+                &range.etag,
+            );
             let ram_read = cache_manager
                 .ram_cache
                 .as_ref()
@@ -16946,7 +16915,7 @@ mod write_cache_range_sink_tests {
         let reader = make_disk_cache(&temp_dir, batch_size).await;
         let start = 0u64;
         let end = (total_len as u64) - 1;
-        let final_path = reader.get_new_range_file_path(cache_key, start, end);
+        let final_path = reader.get_versioned_range_file_path(cache_key, start, end, "sink-etag");
         assert!(
             final_path.exists(),
             "committed .bin must exist: {:?}",
@@ -17138,7 +17107,7 @@ mod write_cache_range_sink_property_tests {
         let reader = make_disk_cache(temp_dir).await;
         let start = 0u64;
         let end = total_len - 1;
-        let final_path = reader.get_new_range_file_path(cache_key, start, end);
+        let final_path = reader.get_versioned_range_file_path(cache_key, start, end, "prop-etag");
         let ranges_dir = temp_dir.path().join("ranges");
         let relative_path = final_path
             .strip_prefix(&ranges_dir)
@@ -18504,6 +18473,190 @@ mod debit_removed_ranges_tests {
         (acc.current_delta(), acc.current_write_cache_delta())
     }
 
+    fn head_metadata(etag: &str) -> CacheMetadata {
+        CacheMetadata {
+            etag: etag.to_string(),
+            last_modified: "Tue, 13 Oct 2026 00:00:00 GMT".to_string(),
+            content_length: RANGE_BYTES,
+            part_number: None,
+            cache_control: None,
+            access_count: 1,
+            last_accessed: SystemTime::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_eviction_candidate_debits_current_file_and_allows_recache_credit() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let old_relative_path = format!(
+            "test-bucket/ab/cde/object.bin_0-4095.{}.bin",
+            blake3::hash(b"version-a").to_hex()
+        );
+        let old_bin = plant_bin(temp.path(), &old_relative_path);
+        let mut old_range = range_spec(&old_relative_path);
+        old_range.last_accessed = SystemTime::now() - Duration::from_secs(120);
+        old_range.staged = Some(true);
+        manager
+            .store_new_metadata(&crate::cache_types::NewCacheMetadata {
+                cache_key: KEY.to_string(),
+                object_metadata: crate::cache_types::ObjectMetadata {
+                    etag: "version-a".to_string(),
+                    is_write_cached: true,
+                    ..Default::default()
+                },
+                ranges: vec![old_range],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let candidates = manager
+            .collect_range_candidates_for_eviction()
+            .await
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].bin_file_path, old_bin);
+        assert_eq!(candidates[0].staged, Some(true));
+
+        // Overwrite after discovery, before the selected offsets are evicted.
+        std::fs::remove_file(&old_bin).unwrap();
+        let current_relative_path = format!(
+            "test-bucket/ab/cde/object.bin_0-4095.{}.bin",
+            blake3::hash(b"version-b").to_hex()
+        );
+        let current_bin = plant_bin(temp.path(), &current_relative_path);
+        let mut current_range = range_spec(&current_relative_path);
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let accumulator = consolidator.size_accumulator();
+        assert!(accumulator.add_range_file(KEY, &current_range));
+        // The deletion result must use the measured bytes even if metadata drifts.
+        current_range.compressed_size += 37;
+        manager
+            .store_new_metadata(&crate::cache_types::NewCacheMetadata {
+                cache_key: KEY.to_string(),
+                object_metadata: crate::cache_types::ObjectMetadata {
+                    etag: "version-b".to_string(),
+                    ..Default::default()
+                },
+                ranges: vec![current_range],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (freed, _, unlinked_ranges) = manager
+            .batch_evict_range_files(KEY, &candidates)
+            .await
+            .unwrap();
+        assert_eq!(freed, RANGE_BYTES);
+        assert!(!current_bin.exists());
+        assert_eq!(unlinked_ranges.len(), 1);
+        let actual_range = &unlinked_ranges[0];
+        assert_eq!(actual_range.file_path, current_relative_path);
+        assert_eq!(actual_range.compressed_size, RANGE_BYTES);
+        assert_eq!(actual_range.staged, Some(false));
+
+        manager
+            .debit_removed_ranges(
+                KEY,
+                &[RemovedRange {
+                    range_spec: actual_range.clone(),
+                    bin_path: current_bin.to_string_lossy().to_string(),
+                    counts_as_staged: false,
+                }],
+            )
+            .await;
+        assert_eq!(deltas(&manager).await, (0, 0));
+        assert!(
+            accumulator.add_range_file(KEY, actual_range),
+            "recaching B must credit again after B's file was deleted"
+        );
+        assert_eq!(deltas(&manager).await, (RANGE_BYTES as i64, 0));
+    }
+
+    #[tokio::test]
+    async fn changed_head_removes_old_known_and_unknown_version_bytes() {
+        for old_etag in ["\"version-a\"", ""] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let manager = setup(temp.path());
+            let bin = plant_bin(temp.path(), REL_PATH);
+            manager
+                .store_new_metadata(&crate::cache_types::NewCacheMetadata {
+                    cache_key: KEY.to_string(),
+                    object_metadata: crate::cache_types::ObjectMetadata {
+                        etag: old_etag.to_string(),
+                        ..Default::default()
+                    },
+                    ranges: vec![range_spec(REL_PATH)],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+
+            manager
+                .store_head_cache_entry_unified(KEY, HashMap::new(), head_metadata("\"version-b\""))
+                .await
+                .unwrap();
+
+            let metadata = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+            assert_eq!(metadata.object_metadata.etag, "\"version-b\"");
+            assert!(metadata.ranges.is_empty());
+            assert!(!bin.exists());
+            assert_eq!(deltas(&manager).await, (-(RANGE_BYTES as i64), 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_head_cleanup_retains_old_version_and_failed_file_ownership() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let removed_bin = plant_bin(temp.path(), REL_PATH);
+        let failed_rel_path = "test-bucket/ab/cde/object.bin_4096-8191.bin";
+        let failed_path = temp.path().join("ranges").join(failed_rel_path);
+        // A directory cannot be unlinked as a file, even when tests run as root.
+        std::fs::create_dir_all(&failed_path).unwrap();
+        let mut failed_range = range_spec(failed_rel_path);
+        failed_range.start = RANGE_BYTES;
+        failed_range.end = 2 * RANGE_BYTES - 1;
+        manager
+            .store_new_metadata(&crate::cache_types::NewCacheMetadata {
+                cache_key: KEY.to_string(),
+                object_metadata: crate::cache_types::ObjectMetadata {
+                    etag: "\"version-a\"".to_string(),
+                    ..Default::default()
+                },
+                ranges: vec![range_spec(REL_PATH), failed_range],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(manager
+            .store_head_cache_entry_unified(KEY, HashMap::new(), head_metadata("\"version-b\""),)
+            .await
+            .is_err());
+
+        let metadata = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+        assert_eq!(metadata.object_metadata.etag, "\"version-a\"");
+        assert!(metadata
+            .ranges
+            .iter()
+            .any(|range| range.file_path == failed_rel_path));
+        assert!(failed_path.exists());
+        assert!(!removed_bin.exists());
+        assert_eq!(deltas(&manager).await, (-(RANGE_BYTES as i64), 0));
+
+        std::fs::remove_dir(&failed_path).unwrap();
+        manager
+            .store_head_cache_entry_unified(KEY, HashMap::new(), head_metadata("\"version-b\""))
+            .await
+            .unwrap();
+        let metadata = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+        assert_eq!(metadata.object_metadata.etag, "\"version-b\"");
+        assert!(metadata.ranges.is_empty());
+        assert_eq!(deltas(&manager).await, (-(RANGE_BYTES as i64), 0));
+    }
+
     #[tokio::test]
     async fn staged_range_debits_both_channels() {
         let temp = tempfile::TempDir::new().unwrap();
@@ -18766,7 +18919,7 @@ mod full_object_supersedes_partial_ranges_tests {
     }
 
     /// Seed a `.meta` holding two partial ranges, with their `.bin` files present.
-    /// Partial is what puts the call into the superseding branch: `is_full_object_cached`
+    /// Seed partial coverage that a subsequent full response will replace.
     /// requires exactly one range spanning `0..content_length-1`.
     fn seed_partial_entry(
         manager: &CacheManager,
@@ -18844,6 +18997,140 @@ mod full_object_supersedes_partial_ranges_tests {
             .store_full_object_as_range_new(KEY, &vec![3u8; OBJECT_BYTES as usize], object_metadata)
             .await
             .expect("full-object store should succeed");
+    }
+
+    #[tokio::test]
+    async fn buffered_full_get_replaces_owned_version_without_changing_open_read() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        let first_body = vec![b'A'; OBJECT_BYTES as usize];
+        let second_body = vec![b'B'; OBJECT_BYTES as usize];
+        let response_metadata = |etag: &str| CacheMetadata {
+            etag: etag.to_string(),
+            last_modified: "Tue, 13 Oct 2026 00:00:00 GMT".to_string(),
+            content_length: OBJECT_BYTES,
+            part_number: None,
+            cache_control: None,
+            access_count: 1,
+            last_accessed: SystemTime::now(),
+        };
+
+        manager
+            .store_response_with_headers(
+                KEY,
+                &first_body,
+                HashMap::new(),
+                response_metadata("version-a"),
+            )
+            .await
+            .unwrap();
+        let first_metadata = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+        let first_range = &first_metadata.ranges[0];
+        let first_path = temp.path().join("ranges").join(&first_range.file_path);
+        let first_bytes = std::fs::read(&first_path).unwrap();
+        let mut first_file = std::fs::File::open(&first_path).unwrap();
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let first_consolidation = consolidator.consolidate_object(KEY).await.unwrap();
+        assert_eq!(first_consolidation.consolidated_entries.len(), 1);
+        consolidator
+            .cleanup_consolidated_entries(
+                &first_consolidation.consolidated_entries,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(consolidator
+            .get_all_entries_for_cache_key(KEY)
+            .await
+            .unwrap()
+            .is_empty());
+
+        manager
+            .store_response_with_headers(
+                KEY,
+                &second_body,
+                HashMap::new(),
+                response_metadata("version-b"),
+            )
+            .await
+            .unwrap();
+        let second_metadata = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+        let second_range = &second_metadata.ranges[0];
+        let second_path = temp.path().join("ranges").join(&second_range.file_path);
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            first_path.parent(),
+            Some(temp.path().join("ranges").as_path())
+        );
+        assert_eq!(second_path.parent(), first_path.parent());
+        assert!(!first_path.exists(), "superseded A must not be orphaned");
+        let mut open_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut first_file, &mut open_bytes).unwrap();
+        assert_eq!(open_bytes, first_bytes);
+
+        let disk = manager.create_configured_disk_cache_manager();
+        assert_eq!(
+            crate::compression::CompressionHandler::new(1024, true)
+                .decompress_with_algorithm(&open_bytes, first_range.compression_algorithm.clone())
+                .unwrap(),
+            first_body,
+            "an open A descriptor must still read A after B is published"
+        );
+        assert_eq!(
+            disk.load_range_data_for_version(second_range, KEY, "version-b")
+                .await
+                .unwrap(),
+            second_body
+        );
+        let credited = second_range.compressed_size as i64;
+        assert_eq!(consolidator.size_accumulator().current_delta(), credited);
+
+        manager
+            .store_response_with_headers(
+                KEY,
+                &second_body,
+                HashMap::new(),
+                response_metadata("version-b"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(consolidator.size_accumulator().current_delta(), credited);
+    }
+
+    #[tokio::test]
+    async fn failed_full_object_cleanup_preserves_old_owner_and_releases_write_lock() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = setup(temp.path());
+        store_full_object(&manager, "version-a").await;
+        let metadata = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+        let old_path = temp
+            .path()
+            .join("ranges")
+            .join(&metadata.ranges[0].file_path);
+        std::fs::remove_file(&old_path).unwrap();
+        std::fs::create_dir(&old_path).unwrap();
+        let consolidator = manager.get_journal_consolidator().await.unwrap();
+        let before = consolidator.size_accumulator().current_delta();
+
+        assert!(manager
+            .store_full_object_as_range_new(
+                KEY,
+                &vec![b'B'; OBJECT_BYTES as usize],
+                crate::cache_types::ObjectMetadata {
+                    etag: "version-b".to_string(),
+                    content_length: OBJECT_BYTES,
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err());
+
+        let retained = manager.get_metadata_from_disk(KEY).await.unwrap().unwrap();
+        assert_eq!(retained.object_metadata.etag, "version-a");
+        assert_eq!(retained.ranges, metadata.ranges);
+        assert!(old_path.exists());
+        assert!(!manager.get_lock_file_path(KEY).exists());
+        assert_eq!(consolidator.size_accumulator().current_delta(), before);
     }
 
     /// The case that was broken: a changed ETag. Pre-fix this arm logged
@@ -19310,7 +19597,7 @@ mod graduation_clears_staged_membership_tests {
             "fixture: every .bin must have existed and been deleted, or the debit list \
              is short for a reason unrelated to classification"
         );
-        let removed_bytes: u64 = removed.iter().map(|r| r.compressed_size).sum();
+        let removed_bytes: u64 = removed.iter().map(|r| r.range_spec.compressed_size).sum();
         assert!(
             removed_bytes > 0,
             "fixture: the removal must cover a non-zero number of bytes, or the debit \
@@ -19326,7 +19613,7 @@ mod graduation_clears_staged_membership_tests {
                  already subtracted — undershoot, and since Phase F ledger-driven \
                  eviction is the only Staging_Bound enforcement, an undershooting \
                  figure reads as under bound and eviction never runs",
-                range.compressed_size
+                range.range_spec.compressed_size
             );
         }
 

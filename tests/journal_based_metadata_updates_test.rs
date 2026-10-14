@@ -6,20 +6,26 @@
 use s3_proxy::cache_hit_update_buffer::CacheHitUpdateBuffer;
 use s3_proxy::cache_types::{NewCacheMetadata, ObjectMetadata, RangeSpec};
 use s3_proxy::compression::CompressionAlgorithm;
+use s3_proxy::disk_cache::{get_sharded_path, object_version_id};
 use s3_proxy::journal_consolidator::{ConsolidationConfig, JournalConsolidator};
 use s3_proxy::journal_manager::{JournalEntry, JournalManager, JournalOperation};
 use s3_proxy::metadata_lock_manager::MetadataLockManager;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
 
-/// Create a test range spec
-fn create_test_range_spec(start: u64, end: u64) -> RangeSpec {
+/// Create a test range spec at the sharded path of a file named for the object
+/// version `etag`: consolidation resolves `ranges/<file_path>` and retires any
+/// `.meta` range whose file is not named for the `.meta`'s ETag.
+fn create_test_range_spec(cache_key: &str, start: u64, end: u64, etag: &str) -> RangeSpec {
     let now = SystemTime::now();
+    let suffix = format!("_{}-{}.{}.bin", start, end, object_version_id(etag));
+    let file_path = get_sharded_path(Path::new(""), cache_key, &suffix).unwrap();
     RangeSpec {
         start,
         end,
-        file_path: format!("test_range_{}-{}.bin", start, end),
+        file_path: file_path.to_string_lossy().into_owned(),
         compression_algorithm: CompressionAlgorithm::Lz4,
         compressed_size: end - start + 1,
         uncompressed_size: end - start + 1,
@@ -33,11 +39,13 @@ fn create_test_range_spec(start: u64, end: u64) -> RangeSpec {
 /// Create test metadata with a range
 fn create_test_metadata(cache_key: &str, range_start: u64, range_end: u64) -> NewCacheMetadata {
     let now = SystemTime::now();
-    let range_spec = create_test_range_spec(range_start, range_end);
+    let object_metadata = ObjectMetadata::default();
+    let range_spec =
+        create_test_range_spec(cache_key, range_start, range_end, &object_metadata.etag);
 
     NewCacheMetadata {
         cache_key: cache_key.to_string(),
-        object_metadata: ObjectMetadata::default(),
+        object_metadata,
         ranges: vec![range_spec],
         created_at: now,
         expires_at: now + Duration::from_secs(3153600000),
@@ -261,9 +269,7 @@ async fn test_consolidation_cleanup_on_success() {
 
     // Create range file (required for validation)
     let range_base_dir = temp_dir.path().join("ranges");
-    let range_path =
-        s3_proxy::disk_cache::get_sharded_path(&range_base_dir, cache_key, "_0-8388607.bin")
-            .unwrap();
+    let range_path = range_base_dir.join(&metadata.ranges[0].file_path);
     if let Some(parent) = range_path.parent() {
         tokio::fs::create_dir_all(parent).await.unwrap();
     }
@@ -376,9 +382,7 @@ async fn test_consolidation_preserves_entries_with_missing_range_files() {
     // Create range file ONLY for range 1 (0-8388607)
     // Range 2 (8388608-16777215) does NOT have a range file - simulates NFS caching delay
     let range_base_dir = temp_dir.path().join("ranges");
-    let range_path =
-        s3_proxy::disk_cache::get_sharded_path(&range_base_dir, cache_key, "_0-8388607.bin")
-            .unwrap();
+    let range_path = range_base_dir.join(&metadata.ranges[0].file_path);
     if let Some(parent) = range_path.parent() {
         tokio::fs::create_dir_all(parent).await.unwrap();
     }
@@ -462,9 +466,7 @@ async fn test_consolidation_applies_ttl_refresh() {
 
     // Create range file
     let range_base_dir = temp_dir.path().join("ranges");
-    let range_path =
-        s3_proxy::disk_cache::get_sharded_path(&range_base_dir, cache_key, "_0-8388607.bin")
-            .unwrap();
+    let range_path = range_base_dir.join(&initial_metadata.ranges[0].file_path);
     if let Some(parent) = range_path.parent() {
         tokio::fs::create_dir_all(parent).await.unwrap();
     }
@@ -543,9 +545,7 @@ async fn test_consolidation_applies_access_update() {
 
     // Create range file
     let range_base_dir = temp_dir.path().join("ranges");
-    let range_path =
-        s3_proxy::disk_cache::get_sharded_path(&range_base_dir, cache_key, "_0-8388607.bin")
-            .unwrap();
+    let range_path = range_base_dir.join(&initial_metadata.ranges[0].file_path);
     if let Some(parent) = range_path.parent() {
         tokio::fs::create_dir_all(parent).await.unwrap();
     }

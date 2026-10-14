@@ -200,7 +200,8 @@ async fn test_bin_file_deletion_on_eviction() {
         .unwrap();
 
     // Verify .bin file exists using new sharded path
-    let range_file_path = disk_cache.get_new_range_file_path(cache_key, range_start, range_end);
+    let range_file_path =
+        disk_cache.get_versioned_range_file_path(cache_key, range_start, range_end, "test-etag");
     assert!(
         range_file_path.exists(),
         ".bin file should exist after storing range"
@@ -478,8 +479,8 @@ async fn test_multiple_range_eviction_meta_deletion() {
         .unwrap();
 
     // Verify both .bin files and .meta file exist using new sharded paths
-    let range1_path = disk_cache.get_new_range_file_path(cache_key, 0, 1023);
-    let range2_path = disk_cache.get_new_range_file_path(cache_key, 1024, 2047);
+    let range1_path = disk_cache.get_versioned_range_file_path(cache_key, 0, 1023, "test-etag");
+    let range2_path = disk_cache.get_versioned_range_file_path(cache_key, 1024, 2047, "test-etag");
     let metadata_path = disk_cache.get_new_metadata_file_path(cache_key);
 
     assert!(range1_path.exists(), "Range 1 .bin file should exist");

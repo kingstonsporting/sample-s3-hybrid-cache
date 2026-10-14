@@ -178,6 +178,13 @@ async fn expired_full_object_mainline_get_changed_object_serves_fresh_bytes() {
         OBJECT_SIZE as usize,
         "R2.4: the fresh representation must be returned, never the expired bytes",
     );
+    assert_eq!(
+        captured.len(),
+        1,
+        "the conditional 200 already carries the changed object; fetching it again \
+         doubles the transfer. Captured: {:#?}",
+        captured
+    );
 }
 
 /// R2.5: an authorization error must not fail open to expired data.

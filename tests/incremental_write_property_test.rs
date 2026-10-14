@@ -151,9 +151,10 @@ fn prop_incremental_write_round_trip() {
             }
 
             // Construct the RangeSpec manually using the known file path.
-            // get_new_range_file_path computes the final .bin path; we need the
+            // get_versioned_range_file_path computes the final .bin path; we need the
             // relative portion under the "ranges" directory.
-            let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let final_path =
+                cache_manager.get_versioned_range_file_path(cache_key, start, end, "test-etag");
             let ranges_dir = temp_dir.path().join("ranges");
             let relative_path = final_path
                 .strip_prefix(&ranges_dir)
@@ -308,8 +309,8 @@ fn prop_incremental_write_equivalence_to_single_shot() {
             }
 
             // --- Read raw .bin files from disk ---
-            let incr_bin_path = incr_cache.get_new_range_file_path(cache_key, start, end);
-            let shot_bin_path = shot_cache.get_new_range_file_path(cache_key, start, end);
+            let incr_bin_path = incr_cache.get_versioned_range_file_path(cache_key, start, end, "test-etag");
+            let shot_bin_path = shot_cache.get_versioned_range_file_path(cache_key, start, end, "test-etag");
 
             let incr_compressed = match std::fs::read(&incr_bin_path) {
                 Ok(d) => d,

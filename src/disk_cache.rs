@@ -4,6 +4,7 @@
 //! Supports shared cache coordination for multi-instance deployments.
 
 use crate::cache_hit_update_buffer::CacheHitUpdateBuffer;
+use crate::cache_types::NewCacheMetadata;
 use crate::compression::CompressionHandler;
 use crate::hybrid_metadata_writer::{HybridMetadataWriter, WriteMode};
 use crate::path_safety::is_safe_relative_file_path;
@@ -95,6 +96,11 @@ pub struct BatchRangeDeletion {
     ///
     /// Spec: cache-eviction-at-scale. Requirements: 7.2
     pub unlinked_extents: Vec<(u64, u64)>,
+    /// Actual range files unlinked from the current metadata, including identity
+    /// and tier. `compressed_size` is their measured on-disk size, and `staged`
+    /// records the classification at deletion time. Use these for accounting;
+    /// discovery candidates may describe an older object version at the same offsets.
+    pub unlinked_ranges: Vec<crate::cache_types::RangeSpec>,
     /// Extents whose `.bin` unlink **failed while the file is still present**, and
     /// which were therefore left in the object's `.meta` rather than stripped from
     /// it (Requirement 15.2).
@@ -430,6 +436,11 @@ pub struct DiskCacheManager {
     /// Optional JournalConsolidator for direct size tracking
     /// When set, size is updated directly when storing new ranges (bypasses journal-based tracking)
     journal_consolidator: Option<Arc<crate::journal_consolidator::JournalConsolidator>>,
+    /// The process-wide RAM `.meta` snapshot cache. Invalidated when a store
+    /// replaces the cached object version.
+    metadata_cache: Option<Arc<crate::metadata_cache::MetadataCache>>,
+    /// Object versions this process has confirmed as `.meta` identities.
+    confirmed_versions: Arc<ConfirmedVersions>,
     /// Target size for the in-memory compression batch used by `IncrementalRangeWriter`.
     /// Incoming body chunks are accumulated into a batch buffer and flushed as a single
     /// LZ4 frame once the buffer reaches this size. Plumbed from `CacheConfig::compression_batch_size`.
@@ -474,6 +485,8 @@ impl DiskCacheManager {
             hybrid_metadata_writer: None,
             cache_hit_update_buffer: None,
             journal_consolidator: None,
+            metadata_cache: None,
+            confirmed_versions: Arc::default(),
             compression_batch_size,
             metadata_io_semaphore: Arc::new(tokio::sync::Semaphore::new(32)),
             max_metadata_file_bytes: 4 * 1024 * 1024, // 4 MiB default
@@ -579,6 +592,17 @@ impl DiskCacheManager {
 
     /// Set journal consolidator for direct size tracking
     /// When set, size is updated directly when storing new ranges
+    pub fn set_metadata_cache(
+        &mut self,
+        metadata_cache: Arc<crate::metadata_cache::MetadataCache>,
+    ) {
+        self.metadata_cache = Some(metadata_cache);
+    }
+
+    pub fn set_confirmed_versions(&mut self, confirmed_versions: Arc<ConfirmedVersions>) {
+        self.confirmed_versions = confirmed_versions;
+    }
+
     pub fn set_journal_consolidator(
         &mut self,
         consolidator: Arc<crate::journal_consolidator::JournalConsolidator>,
@@ -633,6 +657,7 @@ impl DiskCacheManager {
         cache_key: &str,
         requested_start: u64,
         requested_end: u64,
+        object_etag: Option<&str>,
     ) -> Result<Vec<crate::cache_types::RangeSpec>> {
         // Only check journals in shared storage mode
         if !self.is_shared_storage_mode() {
@@ -644,7 +669,13 @@ impl DiskCacheManager {
             return Ok(Vec::new());
         }
 
+        // Without an object snapshot there is no validator with which the
+        // caller can authenticate these bytes. Fetch from S3 instead.
+        let Some(object_etag) = object_etag else {
+            return Ok(Vec::new());
+        };
         let mut matching_ranges = Vec::new();
+        let encoded_key = crate::journal_manager::encoded_cache_key(cache_key);
 
         // Scan all .journal files
         let journal_entries = match std::fs::read_dir(&journals_dir) {
@@ -681,14 +712,15 @@ impl DiskCacheManager {
             };
 
             for line in content.lines() {
-                if line.trim().is_empty() {
+                if line.trim().is_empty() || !line.contains(&encoded_key) {
                     continue;
                 }
 
-                let entry: crate::journal_manager::JournalEntry = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
+                let entry: crate::journal_manager::PendingRangeView =
+                    match serde_json::from_str(line) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
 
                 // Check if this entry is for our cache key and is an Add operation
                 if entry.cache_key != cache_key {
@@ -696,6 +728,13 @@ impl DiskCacheManager {
                 }
 
                 if entry.operation != crate::journal_manager::JournalOperation::Add {
+                    continue;
+                }
+
+                // HEAD may have refreshed the object since these bytes were
+                // journaled. A pending range must pass the same version check
+                // as consolidation before it can use that HEAD's validators.
+                if !entry.matches_object_version(object_etag) {
                     continue;
                 }
 
@@ -863,8 +902,14 @@ impl DiskCacheManager {
 
         // Step 3: Remove all range binary files (new structure)
         for range_spec in &ranges_to_remove {
-            let range_file_path =
-                self.get_new_range_file_path(cache_key, range_spec.start, range_spec.end);
+            if !is_safe_relative_file_path(&range_spec.file_path) {
+                warn!(
+                    "Skipping unsafe range path during invalidation: {}",
+                    range_spec.file_path
+                );
+                continue;
+            }
+            let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
             if range_file_path.exists() {
                 match std::fs::remove_file(&range_file_path) {
@@ -1112,6 +1157,23 @@ impl DiskCacheManager {
         }
     }
 
+    /// Different object versions never replace each other's range files.
+    pub fn get_versioned_range_file_path(
+        &self,
+        cache_key: &str,
+        start: u64,
+        end: u64,
+        etag: &str,
+    ) -> PathBuf {
+        versioned_range_file_path(
+            self.get_new_range_file_path(cache_key, start, end),
+            cache_key,
+            start,
+            end,
+            etag,
+        )
+    }
+
     /// Sanitize cache key for new range storage architecture
     /// Uses percent encoding to prevent collisions while maintaining filesystem safety
     /// For keys that would exceed 200 characters, uses BLAKE3 hash to ensure filesystem compatibility
@@ -1327,8 +1389,10 @@ impl DiskCacheManager {
         // Step 2: Write range data to .tmp file (but don't make it visible yet)
         // We'll rename it AFTER updating metadata to avoid race conditions
         let write_start = std::time::Instant::now();
-        let range_file_path = self.get_new_range_file_path(cache_key, start, end);
-        let range_tmp_path = range_file_path.with_extension("bin.tmp");
+        let range_file_path =
+            self.get_versioned_range_file_path(cache_key, start, end, &object_metadata.etag);
+        let range_tmp_path =
+            range_file_path.with_file_name(format!("{}.bin.tmp", uuid::Uuid::new_v4()));
 
         debug!(
             "Writing range binary file to temp: key={}, range={}-{}, path={:?}, size={} bytes",
@@ -1433,6 +1497,18 @@ impl DiskCacheManager {
                 cache_key, start, end
             );
 
+            let mut writer = hybrid_writer.lock().await.clone();
+            let _version_lock = match self
+                .claim_object_version(cache_key, &object_metadata, ttl, &writer)
+                .await
+            {
+                Ok(lock) => lock,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&range_tmp_path);
+                    return Err(error);
+                }
+            };
+
             // Step 1: Make range file visible FIRST
             // This must happen before journal write so that when other proxies read the journal
             // entry during consolidation, the referenced range file already exists.
@@ -1452,11 +1528,10 @@ impl DiskCacheManager {
             // The journal consolidator will merge entries into metadata files asynchronously
             // Note: Reduce consolidation_interval in config for faster cross-instance visibility
             // Pass object_metadata so journal consolidation can create .meta with response_headers
-            let mut writer = hybrid_writer.lock().await;
             if let Err(e) = writer
                 .write_range_metadata(
                     cache_key,
-                    range_spec,
+                    range_spec.clone(),
                     WriteMode::JournalOnly,
                     Some(object_metadata.clone()),
                     ttl,
@@ -1487,12 +1562,9 @@ impl DiskCacheManager {
             // This prevents cross-instance over-counting on shared storage
             if let Some(consolidator) = &self.journal_consolidator {
                 if !range_already_existed {
-                    consolidator.size_accumulator().add_range(
-                        cache_key,
-                        start,
-                        end,
-                        compressed_size,
-                    );
+                    consolidator
+                        .size_accumulator()
+                        .add_range_file(cache_key, &range_spec);
                     // Track write cache if applicable (completed PutObject or CompleteMPU).
                     // Classified through the single shared predicate (computed above,
                     // before the path was moved) so this add can never disagree with the
@@ -1924,13 +1996,7 @@ impl DiskCacheManager {
             })?;
         }
 
-        // Unique .tmp filename with random suffix for concurrent write safety
-        let random_suffix: u32 = fastrand::u32(..);
-        let stem = range_file_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let tmp_filename = format!("{}.{:08x}.tmp", stem, random_suffix);
+        let tmp_filename = format!("{}.tmp", uuid::Uuid::new_v4());
         let tmp_path = range_file_path.with_file_name(tmp_filename);
 
         let file = std::fs::OpenOptions::new()
@@ -2074,6 +2140,25 @@ impl DiskCacheManager {
         ttl: Duration,
     ) -> Result<()> {
         let cache_key = writer.cache_key.clone();
+        let mut hybrid_writer = match &self.hybrid_metadata_writer {
+            Some(writer) => Some(writer.lock().await.clone()),
+            None => None,
+        };
+        let _version_lock = match &hybrid_writer {
+            Some(metadata_writer) => {
+                match self
+                    .claim_object_version(&cache_key, &object_metadata, ttl, metadata_writer)
+                    .await
+                {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        Self::abort_incremental_range(writer);
+                        return Err(error);
+                    }
+                }
+            }
+            None => None,
+        };
 
         // Finalize the bytes (flush residual batch, validate length, publish the
         // `.bin`). Shared with the no-journal write-cache path so both produce
@@ -2081,8 +2166,11 @@ impl DiskCacheManager {
         // partial-range commit ratio so a received prefix of an incomplete range is
         // salvaged as a clamped sub-range (crt-conditional-range-caching Req 2);
         // the PUT write-cache path passes `None` (exact-only).
-        let (mut range_spec, range_already_existed) =
-            self.finalize_incremental_range(writer, Some(self.partial_range_commit_ratio))?;
+        let (mut range_spec, range_already_existed) = self.finalize_incremental_range(
+            writer,
+            Some(self.partial_range_commit_ratio),
+            &object_metadata.etag,
+        )?;
         let (start, end, compressed_size) =
             (range_spec.start, range_spec.end, range_spec.compressed_size);
         // Classify staging membership before `range_spec` is moved into the journal
@@ -2099,12 +2187,11 @@ impl DiskCacheManager {
         range_spec.staged = Some(counts_as_staged);
 
         // Write journal entry (same pattern as store_range)
-        if let Some(hybrid_writer) = &self.hybrid_metadata_writer {
-            let mut hw = hybrid_writer.lock().await;
+        if let Some(hw) = &mut hybrid_writer {
             if let Err(e) = hw
                 .write_range_metadata(
                     &cache_key,
-                    range_spec,
+                    range_spec.clone(),
                     WriteMode::JournalOnly,
                     Some(object_metadata.clone()),
                     ttl,
@@ -2121,12 +2208,9 @@ impl DiskCacheManager {
             // Track size via in-memory accumulator
             if let Some(consolidator) = &self.journal_consolidator {
                 if !range_already_existed {
-                    consolidator.size_accumulator().add_range(
-                        &cache_key,
-                        start,
-                        end,
-                        compressed_size,
-                    );
+                    consolidator
+                        .size_accumulator()
+                        .add_range_file(&cache_key, &range_spec);
                     if counts_as_staged {
                         consolidator
                             .size_accumulator()
@@ -2169,6 +2253,7 @@ impl DiskCacheManager {
         &self,
         mut writer: IncrementalRangeWriter,
         min_commit_ratio: Option<f64>,
+        etag: &str,
     ) -> Result<(crate::cache_types::RangeSpec, bool)> {
         use crate::cache_types::RangeSpec;
         use std::io::Write;
@@ -2208,19 +2293,19 @@ impl DiskCacheManager {
             // Salvage: clamp the range end to the contiguous prefix actually
             // received. The bytes are in order (single upstream connection), so the
             // first `bytes_written` bytes are exactly the object's bytes for
-            // [start, clamped_end]. Recompute the final path so the `.bin` filename
-            // encodes the clamped end (the read path locates ranges by filename).
+            // [start, clamped_end]. The final path below encodes the clamped end
+            // (the read path locates ranges by filename).
             let clamped_end = writer.start + writer.bytes_written - 1;
-            let clamped_final_path =
-                self.get_new_range_file_path(&writer.cache_key, writer.start, clamped_end);
             info!(
                 "Partial range commit: salvaging prefix {}/{} bytes for key={}, requested range {}-{} clamped to {}-{}",
                 writer.bytes_written, expected_size, writer.cache_key,
                 writer.start, writer.end, writer.start, clamped_end
             );
             writer.end = clamped_end;
-            writer.final_path = clamped_final_path;
         }
+
+        writer.final_path =
+            self.get_versioned_range_file_path(&writer.cache_key, writer.start, writer.end, etag);
 
         // Flush file to ensure all buffered data reaches the NFS write cache.
         // This is synchronous and must complete before the rename so the
@@ -3162,6 +3247,7 @@ impl DiskCacheManager {
         // this one. See `BatchRangeDeletion::unlinked_extents`.
         // Spec: cache-eviction-at-scale. Requirements: 7.2
         let mut unlinked_extents: Vec<(u64, u64)> = Vec::new();
+        let mut unlinked_ranges = Vec::new();
         // Extents whose `.bin` unlink failed with the file still present. These are
         // deliberately absent from `ranges_deleted`, so they survive the `retain`
         // below and keep the object's `.meta` alive.
@@ -3174,11 +3260,16 @@ impl DiskCacheManager {
             .ranges
             .iter()
             .filter(|r| ranges_set.contains(&(r.start, r.end)))
+            .filter(|r| is_safe_relative_file_path(&r.file_path))
             .map(|range_spec| {
-                let path =
-                    self.get_new_range_file_path(cache_key, range_spec.start, range_spec.end);
+                let path = self.cache_dir.join("ranges").join(&range_spec.file_path);
                 let key = (range_spec.start, range_spec.end);
                 let ck = cache_key.to_string();
+                let mut removed_range = range_spec.clone();
+                removed_range.staged = Some(crate::cache_types::is_staged_range_spec(
+                    range_spec,
+                    metadata.object_metadata.is_write_cached,
+                ));
                 async move {
                     // Requirement 2.3: Use tokio::fs::metadata (async) instead of std::fs::metadata
                     let file_size = match tokio::fs::metadata(&path).await {
@@ -3228,7 +3319,8 @@ impl DiskCacheManager {
                         }
                     };
 
-                    (key, file_size, outcome, path)
+                    removed_range.compressed_size = file_size;
+                    (key, removed_range, outcome, path)
                 }
             })
             .collect();
@@ -3249,12 +3341,13 @@ impl DiskCacheManager {
         // surviving `.bin` stripped from its `.meta` is an orphan, and § 15.1 shows
         // the validation scan cannot see one: it roots at `metadata/` and never
         // reads `ranges/`, so the bytes are neither reclaimed nor counted, forever.
-        for (range_key, file_size, outcome, path) in results {
+        for (range_key, removed_range, outcome, path) in results {
             match outcome {
                 RangeUnlinkOutcome::Unlinked => {
-                    bytes_freed += file_size;
+                    bytes_freed += removed_range.compressed_size;
                     deleted_paths.push(path);
                     unlinked_extents.push(range_key);
+                    unlinked_ranges.push(removed_range);
                     ranges_deleted.push(range_key);
                 }
                 RangeUnlinkOutcome::AlreadyAbsent => {
@@ -3417,6 +3510,7 @@ impl DiskCacheManager {
             all_ranges_evicted,
             deleted_paths,
             unlinked_extents,
+            unlinked_ranges,
             retained_extents,
         })
     }
@@ -3675,27 +3769,10 @@ impl DiskCacheManager {
             }
         };
 
-        // If no metadata, check journals for pending ranges (shared storage mode)
-        if metadata.is_none() {
-            let journal_ranges = self
-                .find_pending_journal_ranges(cache_key, requested_start, requested_end)
-                .await?;
-            if !journal_ranges.is_empty() {
-                let duration = operation_start.elapsed();
-                debug!(
-                    "[RANGE_OVERLAP] Range lookup completed via journal fallback: key={}, requested_range={}-{}, result=journal_hit, ranges={}, duration={:.2}ms",
-                    cache_key, requested_start, requested_end, journal_ranges.len(), duration.as_secs_f64() * 1000.0
-                );
-                // Journal records carry no expiry and no validators, so there is
-                // no `expires_at` that could have passed. Reported Fresh, and
-                // their semantics are unchanged by this spec (R1.6, and the
-                // journal exclusion in the design's lookup-result section).
-                return Ok(RangeLookupResult::fresh(journal_ranges));
-            }
+        // Without metadata there is no object identity to validate.
+        let Some(metadata) = metadata else {
             return Ok(RangeLookupResult::empty());
-        }
-
-        let metadata = metadata.unwrap();
+        };
 
         // Object-level stored expiry (lazy expiration - Requirement 1.4).
         // `get_metadata()` does not check `expires_at` for range lookups; the
@@ -3739,10 +3816,15 @@ impl DiskCacheManager {
             StoredFreshness::Fresh
         };
 
-        // Find all overlapping ranges
+        // Find all overlapping ranges among those that belong to this version.
         let mut overlapping_ranges = Vec::new();
+        let version_id = object_version_id(&metadata.object_metadata.etag);
 
-        for range_spec in &metadata.ranges {
+        for range_spec in metadata
+            .ranges
+            .iter()
+            .filter(|range| range_file_belongs_to(range, &version_id))
+        {
             // Requirement 1.5: Log each range being checked for overlap
             let overlaps = requested_start <= range_spec.end && range_spec.start <= requested_end;
             debug!(
@@ -3796,7 +3878,12 @@ impl DiskCacheManager {
         if overlapping_ranges.is_empty() {
             // No overlapping ranges in metadata - check journals for pending ranges (shared storage mode)
             let journal_ranges = self
-                .find_pending_journal_ranges(cache_key, requested_start, requested_end)
+                .find_pending_journal_ranges(
+                    cache_key,
+                    requested_start,
+                    requested_end,
+                    Some(&metadata.object_metadata.etag),
+                )
                 .await?;
             if !journal_ranges.is_empty() {
                 debug!(
@@ -3823,6 +3910,232 @@ impl DiskCacheManager {
         })
     }
 
+    async fn read_disk_metadata(&self, cache_key: &str) -> Result<Option<NewCacheMetadata>> {
+        let _permit = self
+            .metadata_io_semaphore
+            .acquire()
+            .await
+            .map_err(|_| ProxyError::CacheError("Metadata I/O semaphore closed".to_string()))?;
+        let path = self.get_new_metadata_file_path(cache_key);
+        let cap = self.max_metadata_file_bytes;
+        let outcome =
+            tokio::task::spawn_blocking(move || read_and_parse_metadata_blocking(&path, cap))
+                .await
+                .map_err(|error| {
+                    ProxyError::CacheError(format!("Metadata read failed: {}", error))
+                })?;
+        match outcome {
+            MetadataReadOutcome::Missing => Ok(None),
+            MetadataReadOutcome::Parsed(metadata) => Ok(Some(*metadata)),
+            _ => Err(ProxyError::CacheError(
+                "Cannot establish cached object version from unreadable metadata".to_string(),
+            )),
+        }
+    }
+
+    /// Make the `.meta` name this response's version before its bytes are
+    /// published. A version this process already confirmed skips the per-key
+    /// lock: versioned file names keep a concurrent identity change safe, because
+    /// lookups and consolidation reject bytes named for another version. Returns
+    /// the lock when it was taken so the caller holds it through publication.
+    async fn claim_object_version(
+        &self,
+        cache_key: &str,
+        object: &crate::cache_types::ObjectMetadata,
+        ttl: Duration,
+        writer: &HybridMetadataWriter,
+    ) -> Result<Option<crate::metadata_lock_manager::MetadataLock>> {
+        if self.confirmed_versions.contains(cache_key, &object.etag) {
+            return Ok(None);
+        }
+        let gate = self.confirmed_versions.gate(cache_key);
+        let _turn = gate.lock().await;
+        if self.confirmed_versions.contains(cache_key, &object.etag) {
+            return Ok(None);
+        }
+        let lock = writer.acquire_metadata_lock(cache_key).await?;
+        self.prepare_object_version(cache_key, object, ttl, writer, &lock)
+            .await?;
+        self.confirmed_versions.confirm(cache_key, &object.etag);
+        Ok(Some(lock))
+    }
+
+    // Called under the shared per-key lock, before any bytes are published, so
+    // the `.meta` always names the version every published range belongs to.
+    // A response for another version replaces the cached one only when its
+    // Last-Modified is strictly newer. Anything else may be a delayed response
+    // for a superseded version; revalidation settles those cases instead.
+    async fn prepare_object_version(
+        &self,
+        cache_key: &str,
+        object: &crate::cache_types::ObjectMetadata,
+        ttl: Duration,
+        writer: &HybridMetadataWriter,
+        lock: &crate::metadata_lock_manager::MetadataLock,
+    ) -> Result<()> {
+        let refuse = |cached_etag: &str| ProxyError::CacheVersionMismatch {
+            cache_key: cache_key.to_string(),
+            cached_etag: cached_etag.to_string(),
+            response_etag: object.etag.clone(),
+        };
+        // Without an ETag nothing distinguishes one version's bytes from another's.
+        if object.etag.is_empty() {
+            return Err(refuse(""));
+        }
+        let existing = self.read_disk_metadata(cache_key).await?;
+        if let Some(cached) = &existing {
+            let cached_object = &cached.object_metadata;
+            if cached_object.etag == object.etag {
+                return Ok(());
+            }
+            if !cached_object.etag.is_empty() {
+                let modified = |value: &str| httpdate::parse_http_date(value).ok();
+                let newer = matches!(
+                    (modified(&cached_object.last_modified), modified(&object.last_modified)),
+                    (Some(cached_at), Some(response_at)) if response_at > cached_at
+                );
+                if !newer {
+                    return Err(refuse(&cached_object.etag));
+                }
+            }
+            self.retire_object_version(cache_key, cached).await?;
+            info!(
+                "Cached object version replaced: cache_key={}, cached_etag={}, response_etag={}",
+                cache_key, cached_object.etag, object.etag
+            );
+        }
+        let mut object = object.clone();
+        object.response_headers =
+            crate::cache::CacheManager::strip_response_scoped_headers(&object.response_headers);
+        let now = SystemTime::now();
+        writer
+            .write_metadata_to_disk(
+                &NewCacheMetadata {
+                    cache_key: cache_key.to_string(),
+                    object_metadata: object,
+                    created_at: now,
+                    expires_at: now + ttl,
+                    ..Default::default()
+                },
+                lock,
+            )
+            .await?;
+        if let Some(metadata_cache) = &self.metadata_cache {
+            metadata_cache.invalidate(cache_key).await;
+        }
+        Ok(())
+    }
+
+    /// Delete a superseded version's range files under the caller's per-key
+    /// lock. Any file that cannot be removed keeps the old identity in place,
+    /// so its bytes are never attributed to the new version.
+    async fn retire_object_version(
+        &self,
+        cache_key: &str,
+        cached: &NewCacheMetadata,
+    ) -> Result<()> {
+        let mut removed = Vec::new();
+        let mut failure = None;
+        for range in &cached.ranges {
+            if !is_safe_relative_file_path(&range.file_path) {
+                continue;
+            }
+            let path = self.cache_dir.join("ranges").join(&range.file_path);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed.push((range, path)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    failure = Some(ProxyError::CacheError(format!(
+                        "Could not remove superseded range file {:?} for {}: {}",
+                        path, cache_key, error
+                    )));
+                    break;
+                }
+            }
+        }
+        // Files already removed are debited even when a later unlink failed.
+        if let Some(consolidator) = &self.journal_consolidator {
+            let accumulator = consolidator.size_accumulator();
+            for (range, _) in &removed {
+                accumulator.subtract_range_file(cache_key, range);
+                if crate::cache_types::is_staged_range_spec(
+                    range,
+                    cached.object_metadata.is_write_cached,
+                ) {
+                    accumulator.subtract_write_cache(range.compressed_size);
+                }
+            }
+            consolidator
+                .write_eviction_journal_entries(
+                    removed
+                        .iter()
+                        .map(|(range, path)| {
+                            (
+                                cache_key.to_string(),
+                                range.start,
+                                range.end,
+                                range.compressed_size,
+                                path.to_string_lossy().to_string(),
+                            )
+                        })
+                        .collect(),
+                )
+                .await;
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// The path of a range file that may be served for `version`. A
+    /// version-qualified file is immutable: no other version can ever be written
+    /// under its name, so the name check needs no lock.
+    fn servable_range_path(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        version: Option<(&str, &str)>,
+    ) -> Result<PathBuf> {
+        if !is_safe_relative_file_path(&range_spec.file_path) {
+            return Err(ProxyError::CacheError(
+                "Range file path rejected (unsafe)".to_string(),
+            ));
+        }
+        if let Some((key, etag)) = version {
+            if !range_file_belongs_to(range_spec, &object_version_id(etag)) {
+                return Err(ProxyError::CacheVersionMismatch {
+                    cache_key: key.to_string(),
+                    cached_etag: crate::journal_manager::range_file_version(&range_spec.file_path)
+                        .unwrap_or_default()
+                        .to_string(),
+                    response_etag: etag.to_string(),
+                });
+            }
+        }
+        Ok(self.cache_dir.join("ranges").join(&range_spec.file_path))
+    }
+
+    async fn range_file_error(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        error: std::io::Error,
+    ) -> ProxyError {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            if let Some(metrics) = &self.metrics_manager {
+                metrics.read().await.record_missing_range_file().await;
+            }
+            return ProxyError::CacheError(format!(
+                "Range file not found: {} (cache miss - will fetch from S3)",
+                range_spec.file_path
+            ));
+        }
+        error!(
+            "Failed to read range file: file={}, error={}",
+            range_spec.file_path, error
+        );
+        ProxyError::CacheError(format!(
+            "Failed to read range file {}: {}",
+            range_spec.file_path, error
+        ))
+    }
+
     /// Load range data from binary file with access tracking
     /// Implements Requirements 2.2, 8.2, 1.2 (access tracking)
     ///
@@ -3841,6 +4154,24 @@ impl DiskCacheManager {
         &self,
         range_spec: &crate::cache_types::RangeSpec,
     ) -> Result<Vec<u8>> {
+        self.read_range_data(range_spec, None).await
+    }
+
+    pub async fn load_range_data_for_version(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        cache_key: &str,
+        etag: &str,
+    ) -> Result<Vec<u8>> {
+        self.read_range_data(range_spec, Some((cache_key, etag)))
+            .await
+    }
+
+    async fn read_range_data(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        version: Option<(&str, &str)>,
+    ) -> Result<Vec<u8>> {
         let operation_start = std::time::Instant::now();
         debug!(
             "Starting range data load: file={}, range={}-{}, compressed_size={} bytes, uncompressed_size={} bytes, compression={:?}",
@@ -3858,18 +4189,6 @@ impl DiskCacheManager {
         // Construct full path to range binary file
         // range_spec.file_path is relative to ranges directory, including bucket/XX/YYY directories
         // e.g., "bucket/XX/YYY/filename.bin"
-        // Security (Req 10): reject file_path if it is absolute, contains ".." traversal,
-        // or would escape cache_dir/ranges/. Treat as cache miss.
-        if !is_safe_relative_file_path(&range_spec.file_path) {
-            warn!(
-                "Range read: rejected unsafe file_path={:?} (path traversal attempt), treating as cache miss",
-                range_spec.file_path
-            );
-            return Err(ProxyError::CacheError(format!(
-                "Range file path rejected (unsafe): {} (cache miss - will fetch from S3)",
-                range_spec.file_path
-            )));
-        }
         let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
 
         debug!(
@@ -3877,34 +4196,10 @@ impl DiskCacheManager {
             range_spec.file_path, range_file_path
         );
 
-        // Check if range file exists
-        // Requirement 8.2: Handle missing range binary files
-        if !range_file_path.exists() {
-            debug!(
-                "Range file missing (will fetch from S3): file={}, path={:?}, range={}-{}",
-                range_spec.file_path, range_file_path, range_spec.start, range_spec.end
-            );
-            // Record missing range file metric
-            if let Some(metrics_manager) = &self.metrics_manager {
-                metrics_manager
-                    .read()
-                    .await
-                    .record_missing_range_file()
-                    .await;
-            }
-
-            // Requirement 8.2: When range binary file cannot be read, return error
-            // The caller should fetch from S3 and attempt to recache
-            // This is a cache miss scenario - the caller will handle fetching from S3
-            return Err(ProxyError::CacheError(format!(
-                "Range file not found: {} (cache miss - will fetch from S3)",
-                range_spec.file_path
-            )));
-        }
-
         // Read compressed data from file — async I/O to avoid blocking tokio worker thread (Requirement 3.1)
         let read_start = std::time::Instant::now();
-        let compressed_data = match tokio::fs::read(&range_file_path).await {
+        let path = self.servable_range_path(range_spec, version)?;
+        let compressed_data = match tokio::fs::read(&path).await {
             Ok(data) => {
                 let read_duration = read_start.elapsed();
                 debug!(
@@ -3915,16 +4210,7 @@ impl DiskCacheManager {
                 );
                 data
             }
-            Err(e) => {
-                error!(
-                    "Failed to read range file: file={}, path={:?}, error={}",
-                    range_spec.file_path, range_file_path, e
-                );
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to read range file {}: {}",
-                    range_spec.file_path, e
-                )));
-            }
+            Err(e) => return Err(self.range_file_error(range_spec, e).await),
         };
 
         // Save compressed size for logging before we move compressed_data
@@ -4071,20 +4357,24 @@ impl DiskCacheManager {
         &self,
         range_spec: &crate::cache_types::RangeSpec,
     ) -> Result<(Vec<u8>, crate::compression::CompressionAlgorithm)> {
-        // Security (Req 10): reject file_path if it is absolute, contains ".." traversal,
-        // or would escape cache_dir/ranges/. Treat as cache miss.
-        if !is_safe_relative_file_path(&range_spec.file_path) {
-            warn!(
-                "Range frame read: rejected unsafe file_path={:?} (path traversal attempt), treating as cache miss",
-                range_spec.file_path
-            );
-            return Err(ProxyError::CacheError(format!(
-                "Range file path rejected (unsafe): {} (cache miss - will fetch from S3)",
-                range_spec.file_path
-            )));
-        }
-        let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
+        self.read_range_frame(range_spec, None).await
+    }
 
+    pub async fn load_range_frame_for_version(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        cache_key: &str,
+        etag: &str,
+    ) -> Result<(Vec<u8>, crate::compression::CompressionAlgorithm)> {
+        self.read_range_frame(range_spec, Some((cache_key, etag)))
+            .await
+    }
+
+    async fn read_range_frame(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        version: Option<(&str, &str)>,
+    ) -> Result<(Vec<u8>, crate::compression::CompressionAlgorithm)> {
         debug!(
             "Loading range frame (no decompression): file={}, range={}-{}, compression={:?}",
             range_spec.file_path,
@@ -4093,27 +4383,9 @@ impl DiskCacheManager {
             range_spec.compression_algorithm
         );
 
-        // Check if range file exists
-        if !range_file_path.exists() {
-            debug!(
-                "Range file missing (will fetch from S3): file={}, path={:?}, range={}-{}",
-                range_spec.file_path, range_file_path, range_spec.start, range_spec.end
-            );
-            if let Some(metrics_manager) = &self.metrics_manager {
-                metrics_manager
-                    .read()
-                    .await
-                    .record_missing_range_file()
-                    .await;
-            }
-            return Err(ProxyError::CacheError(format!(
-                "Range file not found: {} (cache miss - will fetch from S3)",
-                range_spec.file_path
-            )));
-        }
-
         // Read frame bytes from file — async I/O to avoid blocking the tokio worker thread.
-        let frame_data = match tokio::fs::read(&range_file_path).await {
+        let path = self.servable_range_path(range_spec, version)?;
+        let frame_data = match tokio::fs::read(&path).await {
             Ok(data) => {
                 debug!(
                     "Range frame file read: file={}, size={} bytes",
@@ -4122,16 +4394,7 @@ impl DiskCacheManager {
                 );
                 data
             }
-            Err(e) => {
-                error!(
-                    "Failed to read range file: file={}, path={:?}, error={}",
-                    range_spec.file_path, range_file_path, e
-                );
-                return Err(ProxyError::CacheError(format!(
-                    "Failed to read range file {}: {}",
-                    range_spec.file_path, e
-                )));
-            }
+            Err(e) => return Err(self.range_file_error(range_spec, e).await),
         };
 
         // Verify frame size matches what we expect (warn only — the file may have been
@@ -4167,20 +4430,26 @@ impl DiskCacheManager {
         range_spec: &crate::cache_types::RangeSpec,
         chunk_size: usize,
     ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes>>> {
-        // Security (Req 10): reject file_path if it is absolute, contains ".." traversal,
-        // or would escape cache_dir/ranges/. Treat as cache miss.
-        if !is_safe_relative_file_path(&range_spec.file_path) {
-            warn!(
-                "Range stream: rejected unsafe file_path={:?} (path traversal attempt), treating as cache miss",
-                range_spec.file_path
-            );
-            return Err(ProxyError::CacheError(format!(
-                "Range file path rejected (unsafe): {} (cache miss - will fetch from S3)",
-                range_spec.file_path
-            )));
-        }
-        let range_file_path = self.cache_dir.join("ranges").join(&range_spec.file_path);
+        self.read_range_stream(range_spec, chunk_size, None).await
+    }
 
+    pub async fn stream_range_data_for_version(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        chunk_size: usize,
+        cache_key: &str,
+        etag: &str,
+    ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes>>> {
+        self.read_range_stream(range_spec, chunk_size, Some((cache_key, etag)))
+            .await
+    }
+
+    async fn read_range_stream(
+        &self,
+        range_spec: &crate::cache_types::RangeSpec,
+        chunk_size: usize,
+        version: Option<(&str, &str)>,
+    ) -> Result<impl futures::Stream<Item = Result<bytes::Bytes>>> {
         debug!(
             "Starting range data stream: file={}, range={}-{}, compression={:?}, chunk_size={}",
             range_spec.file_path,
@@ -4190,25 +4459,15 @@ impl DiskCacheManager {
             chunk_size
         );
 
-        // Check if file exists
-        if !range_file_path.exists() {
-            debug!(
-                "Range file missing for streaming: file={}, path={:?}",
-                range_spec.file_path, range_file_path
-            );
-            return Err(ProxyError::CacheError(format!(
-                "Range file not found: {} (cache miss)",
-                range_spec.file_path
-            )));
-        }
-
         let expected_size = range_spec.uncompressed_size;
         let compression_algorithm = range_spec.compression_algorithm.clone();
 
         // Async file open — does not block tokio worker thread (Requirement 3.1)
-        let file = tokio::fs::File::open(&range_file_path)
-            .await
-            .map_err(|e| ProxyError::CacheError(format!("Failed to open range file: {}", e)))?;
+        let path = self.servable_range_path(range_spec, version)?;
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) => return Err(self.range_file_error(range_spec, e).await),
+        };
 
         // Convert to std::fs::File for FrameDecoder (sync Read trait)
         let std_file = file.into_std().await;
@@ -4424,7 +4683,7 @@ impl DiskCacheManager {
                 cache_key,
                 requested_start,
                 requested_end,
-                None,
+                Some(&metadata),
                 crate::cache_types::RangeLookupPurpose::FreshServe,
             )
             .await?
@@ -4445,7 +4704,9 @@ impl DiskCacheManager {
                     "Found exact match for full object: range {}-{}",
                     range.start, range.end
                 );
-                let data = self.load_range_data(range).await?;
+                let data = self
+                    .load_range_data_for_version(range, cache_key, &metadata.object_metadata.etag)
+                    .await?;
                 return Ok(Some(data));
             }
         }
@@ -4485,7 +4746,9 @@ impl DiskCacheManager {
         let mut full_data = Vec::with_capacity(content_length as usize);
 
         for range in &sorted_ranges {
-            let range_data = self.load_range_data(range).await?;
+            let range_data = self
+                .load_range_data_for_version(range, cache_key, &metadata.object_metadata.etag)
+                .await?;
 
             // Calculate which portion of this range we need
             let copy_start = if range.start < requested_start {
@@ -8092,6 +8355,88 @@ pub fn sanitize_object_key_for_filename(object_key: &str, suffix: &str) -> Strin
     }
 }
 
+/// Object versions this process confirmed as `.meta` identities, so repeated
+/// stores of a known version avoid the per-key lock. An entry never decides
+/// correctness: a stale one only lets a write for a superseded version through,
+/// and lookups and consolidation discard bytes named for another version.
+///
+/// Concurrent claims for one key take turns through an in-process gate, so a
+/// burst of first stores pays for one locked check rather than one each.
+#[derive(Default)]
+pub struct ConfirmedVersions {
+    versions: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    gates: std::sync::Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl ConfirmedVersions {
+    const CAPACITY: usize = 65_536;
+
+    fn contains(&self, cache_key: &str, etag: &str) -> bool {
+        self.versions
+            .lock()
+            .unwrap()
+            .get(cache_key)
+            .is_some_and(|confirmed| confirmed == etag)
+    }
+
+    fn confirm(&self, cache_key: &str, etag: &str) {
+        let mut versions = self.versions.lock().unwrap();
+        if versions.len() >= Self::CAPACITY && !versions.contains_key(cache_key) {
+            versions.clear();
+        }
+        versions.insert(cache_key.to_string(), etag.to_string());
+    }
+
+    fn gate(&self, cache_key: &str) -> Arc<Mutex<()>> {
+        let mut gates = self.gates.lock().unwrap();
+        if gates.len() >= Self::CAPACITY && !gates.contains_key(cache_key) {
+            gates.clear();
+        }
+        Arc::clone(gates.entry(cache_key.to_string()).or_default())
+    }
+}
+
+/// Names one object version inside range file names (`…_<start>-<end>.<id>.bin`).
+pub fn object_version_id(etag: &str) -> String {
+    blake3::hash(etag.as_bytes()).to_hex().to_string()
+}
+
+/// Range bytes belong to an object version only through their file name. Files
+/// without the version, including every file written before versioned names
+/// existed, are never served: their bytes cannot be told apart from an older
+/// object's.
+pub fn range_file_belongs_to(range: &crate::cache_types::RangeSpec, version_id: &str) -> bool {
+    range
+        .file_path
+        .strip_suffix(".bin")
+        .and_then(|stem| stem.strip_suffix(version_id))
+        .and_then(|stem| stem.strip_suffix('.'))
+        .is_some_and(|stem| stem.ends_with(&format!("_{}-{}", range.start, range.end)))
+}
+
+/// Keep each version's bytes separate while respecting filesystem name limits.
+pub(crate) fn versioned_range_file_path(
+    path: PathBuf,
+    cache_key: &str,
+    start: u64,
+    end: u64,
+    etag: &str,
+) -> PathBuf {
+    let version = object_version_id(etag);
+    let path = path.with_extension(format!("{}.bin", version));
+    if path.file_name().is_some_and(|name| name.len() > 255) {
+        path.with_file_name(format!(
+            "{}_{}-{}.{}.bin",
+            blake3::hash(cache_key.as_bytes()).to_hex(),
+            start,
+            end,
+            version
+        ))
+    } else {
+        path
+    }
+}
+
 /// Get sharded path for a cache file using bucket-first directory structure
 ///
 /// This function:
@@ -9053,7 +9398,12 @@ mod tests {
             .unwrap();
 
         // Verify range file exists
-        let range_file_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+        let range_file_path = cache_manager.get_versioned_range_file_path(
+            cache_key,
+            start,
+            end,
+            &object_metadata.etag,
+        );
         assert!(range_file_path.exists(), "Range file should exist");
 
         // Verify metadata file exists
@@ -9184,7 +9534,12 @@ mod tests {
         for i in 0..5 {
             let start = i * 1024;
             let end = start + 1023;
-            let range_file_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let range_file_path = cache_manager.get_versioned_range_file_path(
+                cache_key,
+                start,
+                end,
+                &object_metadata.etag,
+            );
             assert!(range_file_path.exists(), "Range file {} should exist", i);
         }
 
@@ -9245,7 +9600,8 @@ mod tests {
         assert_eq!(metadata.object_metadata.etag, "test-etag");
 
         // Get the path of the first range file
-        let first_range_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
+        let first_range_path =
+            cache_manager.get_versioned_range_file_path(cache_key, 0, 1023, "test-etag");
         assert!(first_range_path.exists(), "First range file should exist");
 
         // Store with different ETag - should invalidate existing ranges and succeed
@@ -9284,7 +9640,8 @@ mod tests {
         );
 
         // Verify new range was stored with new ETag
-        let new_range_path = cache_manager.get_new_range_file_path(cache_key, 1024, 2047);
+        let new_range_path =
+            cache_manager.get_versioned_range_file_path(cache_key, 1024, 2047, "different-etag");
         assert!(new_range_path.exists(), "New range file should exist");
 
         // Verify metadata was updated with new ETag and only new range
@@ -9470,8 +9827,12 @@ mod tests {
             .unwrap();
 
         // Verify range file exists
-        let range_file_path =
-            cache_manager.get_new_range_file_path(cache_key, 0, content_length - 1);
+        let range_file_path = cache_manager.get_versioned_range_file_path(
+            cache_key,
+            0,
+            content_length - 1,
+            &object_metadata.etag,
+        );
         assert!(
             range_file_path.exists(),
             "Full object range file should exist"
@@ -12698,7 +13059,8 @@ mod tests {
         );
 
         // Verify range file exists
-        let range_file_path = cache_manager.get_new_range_file_path(cache_key, 0, 10239);
+        let range_file_path =
+            cache_manager.get_versioned_range_file_path(cache_key, 0, 10239, &object_metadata.etag);
         assert!(range_file_path.exists(), "Range file should exist");
     }
 
@@ -13326,7 +13688,12 @@ mod tests {
         for i in 0..5 {
             let start = i * 1024;
             let end = start + 1023;
-            let range_file_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let range_file_path = cache_manager.get_versioned_range_file_path(
+                cache_key,
+                start,
+                end,
+                &object_metadata.etag,
+            );
             assert!(
                 range_file_path.exists(),
                 "Range file {} should exist before deletion",
@@ -13346,7 +13713,12 @@ mod tests {
         for i in 0..5 {
             let start = i * 1024;
             let end = start + 1023;
-            let range_file_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let range_file_path = cache_manager.get_versioned_range_file_path(
+                cache_key,
+                start,
+                end,
+                &object_metadata.etag,
+            );
             assert!(
                 !range_file_path.exists(),
                 "Range file {} should be deleted",
@@ -13558,7 +13930,8 @@ mod tests {
         }
 
         // Manually delete one range file to simulate inconsistency
-        let range_file_path = cache_manager.get_new_range_file_path(cache_key, 1024, 2047);
+        let range_file_path =
+            cache_manager.get_versioned_range_file_path(cache_key, 1024, 2047, "test-etag");
         std::fs::remove_file(&range_file_path).unwrap();
 
         // Delete cache entry - should not error even with missing range file
@@ -13624,8 +13997,9 @@ mod tests {
             .unwrap();
 
         // Verify deleted range files are gone
-        let range1_path = cache_manager.get_new_range_file_path(cache_key, 1024, 2047);
-        let range2_path = cache_manager.get_new_range_file_path(cache_key, 3072, 4095);
+        let etag = object_metadata.etag.as_str();
+        let range1_path = cache_manager.get_versioned_range_file_path(cache_key, 1024, 2047, etag);
+        let range2_path = cache_manager.get_versioned_range_file_path(cache_key, 3072, 4095, etag);
         assert!(
             !range1_path.exists(),
             "Deleted range 1 file should not exist"
@@ -13636,9 +14010,9 @@ mod tests {
         );
 
         // Verify remaining range files still exist
-        let range0_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
-        let range3_path = cache_manager.get_new_range_file_path(cache_key, 2048, 3071);
-        let range4_path = cache_manager.get_new_range_file_path(cache_key, 4096, 5119);
+        let range0_path = cache_manager.get_versioned_range_file_path(cache_key, 0, 1023, etag);
+        let range3_path = cache_manager.get_versioned_range_file_path(cache_key, 2048, 3071, etag);
+        let range4_path = cache_manager.get_versioned_range_file_path(cache_key, 4096, 5119, etag);
         assert!(range0_path.exists(), "Remaining range 0 file should exist");
         assert!(range3_path.exists(), "Remaining range 3 file should exist");
         assert!(range4_path.exists(), "Remaining range 4 file should exist");
@@ -13733,7 +14107,8 @@ mod tests {
         for i in 0..3 {
             let start = i * 1024;
             let end = start + 1023;
-            let range_file_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let range_file_path =
+                cache_manager.get_versioned_range_file_path(cache_key, start, end, "test-etag");
             assert!(
                 !range_file_path.exists(),
                 "Range file {} should be deleted",
@@ -13978,7 +14353,8 @@ mod tests {
         }
 
         // Manually delete one range file to simulate inconsistency
-        let range_file_path = cache_manager.get_new_range_file_path(cache_key, 1024, 2047);
+        let range_file_path =
+            cache_manager.get_versioned_range_file_path(cache_key, 1024, 2047, "test-etag");
         std::fs::remove_file(&range_file_path).unwrap();
 
         // Delete that range - should handle missing file gracefully
@@ -15169,13 +15545,15 @@ mod tests {
             out
         }
         let bins = collect_bins(&temp_dir.path().join("ranges"));
+        let clamped_suffix = format!("_0-767.{}.bin", object_version_id("etag-partial"));
         assert!(
-            bins.iter().any(|n| n.ends_with("_0-767.bin")),
-            "expected a clamped .bin ending in _0-767.bin, found: {:?}",
+            bins.iter().any(|n| n.ends_with(&clamped_suffix)),
+            "expected a clamped .bin ending in {}, found: {:?}",
+            clamped_suffix,
             bins
         );
         assert!(
-            !bins.iter().any(|n| n.ends_with("_0-1023.bin")),
+            !bins.iter().any(|n| n.contains("_0-1023.")),
             "must NOT publish the requested-end range as complete, found: {:?}",
             bins
         );
@@ -15306,7 +15684,8 @@ mod tests {
             .unwrap();
 
         // Construct RangeSpec manually to read back
-        let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+        let final_path =
+            cache_manager.get_versioned_range_file_path(cache_key, start, end, "test-etag");
         let ranges_dir = temp_dir.path().join("ranges");
         let relative_path = final_path
             .strip_prefix(&ranges_dir)
@@ -15592,7 +15971,8 @@ mod tests {
 
         // Round-trip via load_range_data: construct a RangeSpec pointing at
         // the committed `.bin` file and confirm byte-identical decode.
-        let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+        let final_path =
+            cache_manager.get_versioned_range_file_path(cache_key, start, end, "test-etag");
         let ranges_dir = temp_dir.path().join("ranges");
         let relative_path = final_path
             .strip_prefix(&ranges_dir)

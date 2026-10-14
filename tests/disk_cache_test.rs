@@ -174,7 +174,12 @@ async fn test_atomic_write_operations_with_sharded_paths() {
 
         // Verify the final files exist in sharded paths
         let metadata_path = cache_manager.get_new_metadata_file_path(cache_key);
-        let range_path = cache_manager.get_new_range_file_path(cache_key, 0, data.len() as u64 - 1);
+        let range_path = cache_manager.get_versioned_range_file_path(
+            cache_key,
+            0,
+            data.len() as u64 - 1,
+            &metadata.etag,
+        );
 
         assert!(
             metadata_path.exists(),

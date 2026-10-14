@@ -311,7 +311,7 @@ pub struct SizeAccumulator {
     size_tracking_dir: PathBuf,
     /// Monotonic sequence counter for unique delta file names
     flush_sequence: AtomicU64,
-    /// Dedup set: tracks `(cache_key_hash, range_start, range_end)` currently counted
+    /// Dedup set: tracks `(object_version_hash, range_start, range_end)` currently counted
     /// in `delta`. Prevents double-counting when a stampede causes multiple writes of
     /// the same range. Memory: ~24 bytes per entry.
     ///
@@ -356,8 +356,17 @@ impl SizeAccumulator {
     pub fn add_range(&self, cache_key: &str, start: u64, end: u64, compressed_size: u64) -> bool {
         let key_hash = blake3::hash(cache_key.as_bytes());
         let key_u64 = u64::from_le_bytes(key_hash.as_bytes()[..8].try_into().unwrap());
-        let range_id = (key_u64, start, end);
+        self.add_range_id((key_u64, start, end), compressed_size)
+    }
 
+    /// Credit one range file, distinguishing versions at the same byte offsets.
+    /// Unversioned files share the identity used by [`Self::add_range`].
+    pub fn add_range_file(&self, cache_key: &str, range: &RangeSpec) -> bool {
+        self.add_range_id(Self::range_file_id(cache_key, range), range.compressed_size)
+    }
+
+    fn add_range_id(&self, range_id: (u64, u64, u64), compressed_size: u64) -> bool {
+        let (_, start, end) = range_id;
         let mut recent = self.recent_ranges.lock().unwrap();
         if recent.insert(range_id) {
             drop(recent); // release lock before atomic op
@@ -429,8 +438,17 @@ impl SizeAccumulator {
     ) -> bool {
         let key_hash = blake3::hash(cache_key.as_bytes());
         let key_u64 = u64::from_le_bytes(key_hash.as_bytes()[..8].try_into().unwrap());
-        let range_id = (key_u64, start, end);
+        self.subtract_range_id((key_u64, start, end), compressed_size)
+    }
 
+    /// Debit one removed file and release only that file's dedup entry.
+    /// Unversioned files share the identity used by [`Self::subtract_range`].
+    pub fn subtract_range_file(&self, cache_key: &str, range: &RangeSpec) -> bool {
+        self.subtract_range_id(Self::range_file_id(cache_key, range), range.compressed_size)
+    }
+
+    fn subtract_range_id(&self, range_id: (u64, u64, u64), compressed_size: u64) -> bool {
+        let (_, start, end) = range_id;
         let was_tracked = {
             let mut recent = self.recent_ranges.lock().unwrap();
             recent.remove(&range_id)
@@ -443,6 +461,19 @@ impl SizeAccumulator {
             compressed_size, start, end, was_tracked, self.instance_id
         );
         was_tracked
+    }
+
+    fn range_file_id(cache_key: &str, range: &RangeSpec) -> (u64, u64, u64) {
+        let version = crate::journal_manager::range_file_version(&range.file_path);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(cache_key.as_bytes());
+        if let Some(version) = version {
+            hasher.update(&[0]);
+            hasher.update(version.as_bytes());
+        }
+        let hash = hasher.finalize();
+        let key = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
+        (key, range.start, range.end)
     }
 
     /// Decrement the write-cache size delta. Called after write-cached range eviction.
@@ -1181,22 +1212,9 @@ impl JournalConsolidator {
                     // Track size via accumulator for each successfully written range.
                     // **Validates: Requirements 1.5, 5.2, 5.3**
                     //
-                    // Uses `add_range`'s (cache_key, start, end) dedup, not the plain
-                    // `add` this used before — `add` is unconditional and re-credits the
-                    // same bytes whenever a full object is re-cached through this path
-                    // (CompleteMultipartUpload or a GET-miss full-object re-store both
-                    // funnel through here with an identical range on re-cache). `add_range`
-                    // returns `false` for a duplicate (cache_key, start, end), so a re-cache
-                    // credits nothing a second time, matching the other three credit sites
-                    // (`disk_cache::store_range`, `disk_cache::commit_incremental_range`,
-                    // `CacheManager::credit_staged_range`).
-                    // Spec: write-cache-accounting-and-eviction. Requirements: 6.2
-                    let credited = self.size_accumulator.add_range(
-                        cache_key,
-                        range_spec.start,
-                        range_spec.end,
-                        range_spec.compressed_size,
-                    );
+                    // Deduplicate the actual file so successive object versions
+                    // at the same offsets are credited independently.
+                    let credited = self.size_accumulator.add_range_file(cache_key, &range_spec);
                     // MPU completion ranges go under mpus_in_progress or are write-cached.
                     // Reuses the membership recorded on the range above rather than
                     // re-deriving it, so the credit and the persisted flag cannot
@@ -2938,9 +2956,123 @@ impl JournalConsolidator {
         // range means we should count it as a new cached object.
         let had_no_ranges_before = metadata.ranges.is_empty();
 
+        // A delayed range write may predate a HEAD refresh or an overwrite.
+        // Its bytes belong to the ETag recorded in the journal, not whichever
+        // ETag happens to be on the object metadata at consolidation time.
+        // Retire rejected entries after their unreferenced bytes are cleaned up.
+        let matching_entries: Vec<_> = valid_entries
+            .iter()
+            .filter(|entry| {
+                let matches = entry.matches_object_version(&metadata.object_metadata.etag);
+                if !matches {
+                    warn!(
+                        "Discarding range journal for a different object version: cache_key={}, range={}-{}, journal_etag={}, metadata_etag={}",
+                        cache_key, entry.range_spec.start, entry.range_spec.end,
+                        entry.object_metadata.as_ref().map(|object| object.etag.as_str()).unwrap_or_default(),
+                        metadata.object_metadata.etag
+                    );
+                }
+                matches
+            })
+            .cloned()
+            .collect();
+
         // Resolve conflicts between metadata and journal entries
+        // Publication uses this same lock. Protect files still owned by the
+        // current metadata or a matching pending write before deleting old bytes.
+        let retained_files: HashSet<_> = metadata
+            .ranges
+            .iter()
+            .chain(matching_entries.iter().map(|entry| &entry.range_spec))
+            .map(|range| range.file_path.as_str())
+            .collect();
+        let mut attempted_cleanup = HashSet::new();
+        let mut failed_cleanup = HashSet::new();
+        for entry in &valid_entries {
+            if !matches!(
+                entry.operation,
+                JournalOperation::Add | JournalOperation::Update
+            ) {
+                continue;
+            }
+            let file_path = entry.range_spec.file_path.as_str();
+            if entry.matches_object_version(&metadata.object_metadata.etag)
+                || retained_files.contains(file_path)
+                || !attempted_cleanup.insert(file_path)
+            {
+                continue;
+            }
+            let path = self.get_range_file_path(cache_key, &entry.range_spec)?;
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    self.size_accumulator
+                        .subtract_range_file(cache_key, &entry.range_spec);
+                    if crate::cache_types::is_staged_range_spec(
+                        &entry.range_spec,
+                        entry
+                            .object_metadata
+                            .as_ref()
+                            .is_some_and(|object| object.is_write_cached),
+                    ) {
+                        self.size_accumulator
+                            .subtract_write_cache(entry.range_spec.compressed_size);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    failed_cleanup.insert(entry.range_spec.file_path.clone());
+                    warn!(
+                        "Failed to remove rejected range: cache_key={}, path={:?}, error={}",
+                        cache_key, path, e
+                    );
+                }
+            }
+        }
+
+        // Ranges whose files are not named for this version, including every file
+        // written before versioned names existed, are never served. Retire them so
+        // they cannot shadow a versioned replacement at the same extent. A failed
+        // unlink keeps the range for the next cycle.
+        let version_id = crate::disk_cache::object_version_id(&metadata.object_metadata.etag);
+        let mut retired_files = HashSet::new();
+        for range in metadata
+            .ranges
+            .iter()
+            .filter(|range| !crate::disk_cache::range_file_belongs_to(range, &version_id))
+        {
+            // An unsafe path never resolves to a file this cache owns.
+            let Ok(path) = self.get_range_file_path(cache_key, range) else {
+                retired_files.insert(range.file_path.clone());
+                continue;
+            };
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    self.size_accumulator.subtract_range_file(cache_key, range);
+                    if crate::cache_types::is_staged_range_spec(
+                        range,
+                        metadata.object_metadata.is_write_cached,
+                    ) {
+                        self.size_accumulator
+                            .subtract_write_cache(range.compressed_size);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to remove range of another version: cache_key={}, path={:?}, error={}",
+                        cache_key, path, e
+                    );
+                    continue;
+                }
+            }
+            retired_files.insert(range.file_path.clone());
+        }
+        metadata
+            .ranges
+            .retain(|range| !retired_files.contains(&range.file_path));
+
         let _conflicts_resolved = self
-            .resolve_conflicts(&mut metadata, &valid_entries)
+            .resolve_conflicts(&mut metadata, &matching_entries)
             .await?;
 
         // Apply journal entries to metadata
@@ -2949,7 +3081,7 @@ impl JournalConsolidator {
         // NOTE: size_affecting_entries is no longer used for size tracking - size is now tracked
         // at write/eviction time via the in-memory accumulator (see SizeAccumulator).
         let (entries_consolidated, _size_affecting_entries, graduated_bytes) =
-            self.apply_journal_entries(&mut metadata, &valid_entries);
+            self.apply_journal_entries(&mut metadata, &matching_entries);
 
         // Size tracking is handled by the accumulator at write/eviction time, not during consolidation.
         // Journal entries are processed only for metadata updates via apply_journal_entries() above.
@@ -2990,7 +3122,7 @@ impl JournalConsolidator {
         // Count as new cached object if this is the first time ranges are being added.
         // This covers both truly new objects and HEAD-only .meta files getting their first range.
 
-        // Return the valid entries that were consolidated - these should be removed from journals
+        // Retire applied entries and rejected versions whose cleanup succeeded.
         // Stale entries (old entries with missing range files) are also included for removal
         // Pending entries (recent with missing files) are NOT included and will be retried
 
@@ -3001,8 +3133,12 @@ impl JournalConsolidator {
         let skipped_entries = valid_entries.len() - entries_consolidated;
 
         // Combine valid entries and stale entries for journal cleanup
-        // Both should be removed from the journal - valid ones are consolidated, stale ones are cleaned up
+        // A failed unlink must retain its journal ownership record for retry.
         let mut entries_to_remove = valid_entries;
+        entries_to_remove.retain(|entry| {
+            entry.matches_object_version(&metadata.object_metadata.etag)
+                || !failed_cleanup.contains(&entry.range_spec.file_path)
+        });
         entries_to_remove.extend(stale_entries);
 
         let result = ConsolidationResult {
@@ -3424,9 +3560,8 @@ impl JournalConsolidator {
 
     /// Resolve conflicts between metadata and journal entries
     ///
-    /// This only applies to Add/Update/Remove operations which carry full range data.
-    /// TtlRefresh and AccessUpdate operations are incremental updates that should not
-    /// replace existing range data - they only modify specific fields.
+    /// Only Add/Update entries replace range data. Removal checks must see the
+    /// current file identity and timestamp, and object-level updates carry no bytes.
     pub async fn resolve_conflicts(
         &self,
         metadata: &mut NewCacheMetadata,
@@ -3434,26 +3569,14 @@ impl JournalConsolidator {
     ) -> Result<usize> {
         let mut conflicts_resolved = 0;
 
-        // Group journal entries by range (start, end), but only for operations that
-        // carry full range data (Add, Update, Remove). TtlRefresh, AccessUpdate and
-        // Graduation are object-level updates that should not replace existing ranges.
+        // Group byte publications by range (start, end).
         let mut journal_ranges: HashMap<(u64, u64), &JournalEntry> = HashMap::new();
         for entry in journal_entries {
-            // Skip TtlRefresh, AccessUpdate and Graduation - they don't carry full range
-            // data and must not participate in conflict resolution.
-            //
-            // Graduation matters here specifically because its `RangeSpec` is a carrier
-            // for `compressed_size` with `start`/`end` both 0 and an empty `file_path`.
-            // For a 1-byte object — whose real whole-object range IS (0, 0) — the entry
-            // would collide with that range, win on timestamp (the graduation happens
-            // after the PUT), and overwrite a valid range with the carrier, losing
-            // `file_path` and the true compressed size. Harmless before the validation
-            // fix above only because graduation entries never reached this function.
-            match entry.operation {
-                JournalOperation::TtlRefresh
-                | JournalOperation::AccessUpdate
-                | JournalOperation::Graduation => continue,
-                _ => {}
+            if !matches!(
+                entry.operation,
+                JournalOperation::Add | JournalOperation::Update
+            ) {
+                continue;
             }
 
             let range_key = (entry.range_spec.start, entry.range_spec.end);
@@ -3562,6 +3685,9 @@ impl JournalConsolidator {
                     }
                 }
                 JournalOperation::Remove => {
+                    if !entry.matches_object_version(&metadata.object_metadata.etag) {
+                        continue;
+                    }
                     // Remove range from metadata — but ONLY if the range currently in
                     // metadata is the one this entry refers to, not a NEWER range that
                     // happens to sit at the same offsets.
@@ -3601,10 +3727,13 @@ impl JournalConsolidator {
                     // Spec: write-cache-accounting-and-eviction. Requirements: 1.1, 6.2
                     let original_len = metadata.ranges.len();
                     let mut superseded_by_newer = false;
+                    let removed_file = Path::new(&entry.range_spec.file_path).file_name();
                     metadata.ranges.retain(|r| {
                         let same_extent =
                             r.start == entry.range_spec.start && r.end == entry.range_spec.end;
-                        if !same_extent {
+                        // Removal producers carry absolute or relative paths. The
+                        // basename identifies the version within this object/extent.
+                        if !same_extent || Path::new(&r.file_path).file_name() != removed_file {
                             return true;
                         }
                         if r.created_at > entry.timestamp {
@@ -3750,7 +3879,7 @@ impl JournalConsolidator {
     /// Load existing metadata or create new metadata structure, using object_metadata from journal entries
     ///
     /// When creating new metadata (no existing .meta file), this function will use the `object_metadata`
-    /// from the first journal entry that has it. This ensures that response_headers from the S3 response
+    /// from the newest data entry with an ETag. This ensures that response_headers from the S3 response
     /// are preserved even when the .meta file is created by journal consolidation rather than directly.
     async fn load_or_create_metadata_with_journal_entries(
         &self,
@@ -3774,18 +3903,30 @@ impl JournalConsolidator {
             // Create new metadata
             let now = SystemTime::now();
 
-            // Take object_metadata from the journal entries, preferring one that
-            // carries an ETag: an ETag-less entry must never define the object's
-            // identity when a sibling entry knows it.
-            let object_metadata = journal_entries
+            // Choose one version for the entire object, including a cold batch
+            // containing reads from before and after an overwrite.
+            let object_entry = journal_entries
                 .iter()
-                .filter_map(|entry| entry.object_metadata.as_ref())
-                .find(|metadata| !metadata.etag.is_empty())
+                .filter(|entry| {
+                    matches!(
+                        entry.operation,
+                        JournalOperation::Add | JournalOperation::Update
+                    )
+                })
+                .filter(|entry| {
+                    entry
+                        .object_metadata
+                        .as_ref()
+                        .is_some_and(|object| !object.etag.is_empty())
+                })
+                .max_by_key(|entry| entry.timestamp)
                 .or_else(|| {
                     journal_entries
                         .iter()
-                        .find_map(|entry| entry.object_metadata.as_ref())
-                })
+                        .find(|entry| entry.object_metadata.is_some())
+                });
+            let object_metadata = object_entry
+                .and_then(|entry| entry.object_metadata.as_ref())
                 .cloned()
                 .unwrap_or_else(|| {
                     debug!(
@@ -3808,10 +3949,9 @@ impl JournalConsolidator {
                 );
             }
 
-            // Use TTL from first Add journal entry, or Duration::ZERO (immediately expired) as safe default
-            let object_ttl = journal_entries
-                .iter()
-                .find_map(|e| e.object_ttl_secs)
+            // Freshness belongs to the selected version as well as its bytes.
+            let object_ttl = object_entry
+                .and_then(|entry| entry.object_ttl_secs)
                 .map(Duration::from_secs)
                 .unwrap_or(Duration::ZERO);
 
@@ -4419,13 +4559,16 @@ impl JournalConsolidator {
     /// Get range file path for a cache key and range spec.
     ///
     /// # Errors
-    /// Returns `ProxyError::CacheError` if `cache_key` is malformed (missing
-    /// `bucket/object` separator or containing a rejected bucket segment).
+    /// Returns `ProxyError::CacheError` if the key or recorded path is unsafe.
     fn get_range_file_path(&self, cache_key: &str, range_spec: &RangeSpec) -> Result<PathBuf> {
-        let base_dir = self.cache_dir.join("ranges");
-        let suffix = format!("_{}-{}.bin", range_spec.start, range_spec.end);
-
-        crate::disk_cache::get_sharded_path(&base_dir, cache_key, &suffix)
+        crate::disk_cache::parse_cache_key(cache_key)?;
+        if !crate::path_safety::is_safe_relative_file_path(&range_spec.file_path) {
+            return Err(ProxyError::CacheError(format!(
+                "Unsafe range file path: {}",
+                range_spec.file_path
+            )));
+        }
+        Ok(self.cache_dir.join("ranges").join(&range_spec.file_path))
     }
     /// Graceful shutdown of the journal consolidator
     ///
@@ -4985,6 +5128,262 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn rejected_version_file_is_removed_without_deleting_current_same_offset_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/versioned-range";
+        let ranges_dir = temp_dir.path().join("ranges");
+        let mut ranges = Vec::new();
+        for (etag, fill) in [("version-a", b'A'), ("version-b", b'B')] {
+            let suffix = format!("_0-511.{}.bin", blake3::hash(etag.as_bytes()).to_hex());
+            let path =
+                crate::disk_cache::get_sharded_path(&ranges_dir, cache_key, &suffix).unwrap();
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, vec![fill; 512]).await.unwrap();
+            let mut range = create_test_range_spec(0, 511);
+            range.file_path = path
+                .strip_prefix(&ranges_dir)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            assert!(consolidator
+                .size_accumulator
+                .add_range_file(cache_key, &range));
+            ranges.push(range);
+        }
+        let old_range = &ranges[0];
+        let new_range = &ranges[1];
+        seed_meta_on_disk(
+            &consolidator,
+            &NewCacheMetadata {
+                cache_key: cache_key.to_string(),
+                object_metadata: ObjectMetadata {
+                    etag: "version-b".to_string(),
+                    ..Default::default()
+                },
+                ranges: vec![new_range.clone()],
+                ..Default::default()
+            },
+        )
+        .await;
+        let entry = JournalEntry {
+            timestamp: SystemTime::now(),
+            instance_id: "test-instance".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec: old_range.clone(),
+            operation: JournalOperation::Add,
+            range_file_path: old_range.file_path.clone(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(0),
+            access_increment: None,
+            object_metadata: Some(ObjectMetadata {
+                etag: "version-a".to_string(),
+                ..Default::default()
+            }),
+        };
+        consolidator
+            .journal_manager
+            .append_range_entry(cache_key, entry)
+            .await
+            .unwrap();
+
+        let result = consolidator.consolidate_object(cache_key).await.unwrap();
+        assert!(result.success);
+        assert_eq!(result.consolidated_entries.len(), 1);
+        assert!(!ranges_dir.join(&old_range.file_path).exists());
+        assert_eq!(
+            tokio::fs::read(ranges_dir.join(&new_range.file_path))
+                .await
+                .unwrap(),
+            vec![b'B'; 512]
+        );
+        assert_eq!(consolidator.size_accumulator.current_delta(), 512);
+        assert!(!consolidator
+            .size_accumulator
+            .add_range_file(cache_key, new_range));
+        let persisted: NewCacheMetadata = serde_json::from_str(
+            &tokio::fs::read_to_string(consolidator.get_metadata_file_path(cache_key).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.object_metadata.etag, "version-b");
+        assert_eq!(persisted.ranges, vec![new_range.clone()]);
+    }
+
+    #[test]
+    fn range_file_path_rejects_unsafe_recorded_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let mut range = create_test_range_spec(0, 511);
+        for file_path in ["/outside.bin", "../outside.bin", "bucket/../../outside.bin"] {
+            range.file_path = file_path.to_string();
+            assert!(consolidator
+                .get_range_file_path("test-bucket/object", &range)
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn old_version_remove_cannot_replace_or_strip_new_same_offset_range() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/versioned-range";
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 512);
+        metadata.object_metadata.etag = "version-b".to_string();
+        metadata.ranges[0].file_path =
+            format!("object_0-511.{}.bin", blake3::hash(b"version-b").to_hex());
+        let current_range = metadata.ranges[0].clone();
+        let mut remove = remove_entry_at(cache_key, 0, 511, SystemTime::now());
+        remove.range_spec.file_path = format!(
+            "/cache/ranges/object_0-511.{}.bin",
+            blake3::hash(b"version-a").to_hex()
+        );
+
+        assert_eq!(
+            consolidator
+                .resolve_conflicts(&mut metadata, std::slice::from_ref(&remove))
+                .await
+                .unwrap(),
+            0
+        );
+        let (applied, size_affecting, _) =
+            consolidator.apply_journal_entries(&mut metadata, &[remove]);
+        assert_eq!(applied, 0);
+        assert!(size_affecting.is_empty());
+        assert_eq!(metadata.ranges, vec![current_range]);
+    }
+
+    #[tokio::test]
+    async fn unversioned_remove_preserves_a_different_versioned_file_at_same_offsets() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/versioned-range";
+        let mut metadata = graduated_but_unaccounted_metadata(cache_key, 512);
+        metadata.object_metadata.etag = "version-b".to_string();
+        metadata.ranges[0].file_path =
+            format!("object_0-511.{}.bin", blake3::hash(b"version-b").to_hex());
+        let current_range = metadata.ranges[0].clone();
+        let mut remove = remove_entry_at(cache_key, 0, 511, SystemTime::now());
+        remove.range_spec.file_path = "/cache/ranges/object_0-511.bin".to_string();
+        assert!(current_range.created_at <= remove.timestamp);
+
+        assert_eq!(
+            consolidator
+                .resolve_conflicts(&mut metadata, std::slice::from_ref(&remove))
+                .await
+                .unwrap(),
+            0
+        );
+        let (applied, _, _) = consolidator.apply_journal_entries(&mut metadata, &[remove]);
+        assert_eq!(applied, 1);
+        assert_eq!(metadata.ranges, vec![current_range]);
+    }
+
+    #[tokio::test]
+    async fn failed_rejected_range_cleanup_retains_journals_until_retry() {
+        let temp_dir = TempDir::new().unwrap();
+        let consolidator = graduation_test_consolidator(&temp_dir);
+        let cache_key = "test-bucket/rejected-range";
+        let range_spec = create_test_range_spec(0, 511);
+        let size = range_spec.compressed_size;
+        seed_meta_on_disk(
+            &consolidator,
+            &NewCacheMetadata {
+                cache_key: cache_key.to_string(),
+                object_metadata: ObjectMetadata {
+                    etag: "version-b".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+        let entry = JournalEntry {
+            timestamp: SystemTime::now(),
+            instance_id: "test-instance".to_string(),
+            cache_key: cache_key.to_string(),
+            range_spec,
+            operation: JournalOperation::Add,
+            range_file_path: String::new(),
+            metadata_version: 1,
+            new_ttl_secs: None,
+            object_ttl_secs: Some(0),
+            access_increment: None,
+            object_metadata: Some(ObjectMetadata {
+                etag: "version-a".to_string(),
+                is_write_cached: true,
+                ..Default::default()
+            }),
+        };
+        let path = consolidator
+            .get_range_file_path(cache_key, &entry.range_spec)
+            .unwrap();
+        // A directory at the range path makes unlink fail without permission assumptions.
+        tokio::fs::create_dir_all(&path).await.unwrap();
+        for _ in 0..2 {
+            consolidator
+                .journal_manager
+                .append_range_entry(cache_key, entry.clone())
+                .await
+                .unwrap();
+        }
+        consolidator
+            .size_accumulator
+            .add_range(cache_key, 0, 511, size);
+        consolidator.size_accumulator.add_write_cache(size);
+
+        let failed = consolidator.consolidate_object(cache_key).await.unwrap();
+        assert!(failed.success);
+        assert!(failed.consolidated_entries.is_empty());
+        consolidator
+            .cleanup_consolidated_entries(&failed.consolidated_entries, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            consolidator
+                .journal_manager
+                .get_all_entries_for_cache_key(cache_key)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "failed cleanup must retain every journal that owns the rejected extent"
+        );
+        assert_eq!(consolidator.size_accumulator.current_delta(), size as i64);
+        assert_eq!(
+            consolidator.size_accumulator.current_write_cache_delta(),
+            size as i64
+        );
+
+        tokio::fs::remove_dir(&path).await.unwrap();
+        tokio::fs::write(&path, vec![b'A'; size as usize])
+            .await
+            .unwrap();
+        let retried = consolidator.consolidate_object(cache_key).await.unwrap();
+        assert_eq!(retried.consolidated_entries.len(), 2);
+        assert!(!path.exists());
+        assert_eq!(consolidator.size_accumulator.current_delta(), 0);
+        assert_eq!(consolidator.size_accumulator.current_write_cache_delta(), 0);
+        consolidator
+            .cleanup_consolidated_entries(&retried.consolidated_entries, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(consolidator
+            .journal_manager
+            .get_all_entries_for_cache_key(cache_key)
+            .await
+            .unwrap()
+            .is_empty());
+        consolidator.consolidate_object(cache_key).await.unwrap();
+        assert_eq!(consolidator.size_accumulator.current_delta(), 0);
+        assert_eq!(consolidator.size_accumulator.current_write_cache_delta(), 0);
+    }
+
     /// **The red side for the defect that disabled graduation accounting entirely.**
     ///
     /// A `Graduation` entry must survive `validate_journal_entries_with_staleness`. It was
@@ -5009,9 +5408,12 @@ mod tests {
         // Precondition, and the whole point: the range file the old code looked for does
         // NOT exist. Without this assertion the test could pass because some unrelated
         // fixture happened to create it.
-        let bogus_range_file = consolidator
-            .get_range_file_path(cache_key, &entry.range_spec)
-            .unwrap();
+        let bogus_range_file = crate::disk_cache::get_sharded_path(
+            &temp_dir.path().join("ranges"),
+            cache_key,
+            "_0-0.bin",
+        )
+        .unwrap();
         assert!(
             !bogus_range_file.exists(),
             "precondition: no _0-0.bin may exist, or this test proves nothing about the gate"
@@ -6168,7 +6570,10 @@ mod tests {
         let range_spec = RangeSpec {
             start: 0,
             end: 1023,
-            file_path: "test_range.bin".to_string(),
+            file_path: format!(
+                "test_range_0-1023.{}.bin",
+                crate::disk_cache::object_version_id("test-etag")
+            ),
             compression_algorithm: CompressionAlgorithm::Lz4,
             compressed_size: 1024,
             uncompressed_size: 1024,
@@ -6207,7 +6612,10 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            object_metadata: Some(ObjectMetadata {
+                etag: "test-etag".to_string(),
+                ..Default::default()
+            }),
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -7663,7 +8071,10 @@ mod tests {
         let range_spec = RangeSpec {
             start: 0,
             end: 1023,
-            file_path: "normal_range.bin".to_string(),
+            file_path: format!(
+                "normal_range_0-1023.{}.bin",
+                crate::disk_cache::object_version_id("test-etag")
+            ),
             compression_algorithm: CompressionAlgorithm::Lz4,
             compressed_size: 1024,
             uncompressed_size: 1024,
@@ -7699,7 +8110,10 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            object_metadata: Some(ObjectMetadata {
+                etag: "test-etag".to_string(),
+                ..Default::default()
+            }),
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -7769,7 +8183,10 @@ mod tests {
         let range_spec = RangeSpec {
             start: 0,
             end: 1023,
-            file_path: "cleanup_range.bin".to_string(),
+            file_path: format!(
+                "cleanup_range_0-1023.{}.bin",
+                crate::disk_cache::object_version_id("test-etag")
+            ),
             compression_algorithm: CompressionAlgorithm::Lz4,
             compressed_size: 1024,
             uncompressed_size: 1024,
@@ -7802,7 +8219,10 @@ mod tests {
             new_ttl_secs: None,
             object_ttl_secs: Some(3600),
             access_increment: None,
-            object_metadata: None,
+            object_metadata: Some(ObjectMetadata {
+                etag: "test-etag".to_string(),
+                ..Default::default()
+            }),
         };
         journal_manager
             .append_range_entry(cache_key, entry)
@@ -7929,6 +8349,65 @@ mod subtract_range_tests {
         let temp = tempfile::TempDir::new().unwrap();
         let acc = SizeAccumulator::new(temp.path(), "test-instance".to_string());
         (temp, acc)
+    }
+
+    #[test]
+    fn versioned_range_files_at_same_offsets_are_credited_and_debited_independently() {
+        let (_temp, acc) = accumulator();
+        let old = RangeSpec::new(
+            0,
+            SIZE - 1,
+            format!("object_0-4095.{}.bin", blake3::hash(b"version-a").to_hex()),
+            crate::compression::CompressionAlgorithm::Lz4,
+            SIZE,
+            SIZE,
+        );
+        let new = RangeSpec::new(
+            0,
+            SIZE - 1,
+            format!("object_0-4095.{}.bin", blake3::hash(b"version-b").to_hex()),
+            crate::compression::CompressionAlgorithm::Lz4,
+            SIZE + 7,
+            SIZE,
+        );
+
+        assert!(acc.add_range_file(KEY, &old));
+        assert!(acc.add_range_file(KEY, &new));
+        assert!(!acc.add_range_file(KEY, &old));
+        assert!(!acc.add_range_file(KEY, &new));
+        assert_eq!(acc.current_delta(), (2 * SIZE + 7) as i64);
+
+        let mut removed = old.clone();
+        removed.file_path = format!("/cache/ranges/{}", old.file_path);
+        assert!(acc.subtract_range_file(KEY, &removed));
+        assert_eq!(acc.current_delta(), (SIZE + 7) as i64);
+        assert!(!acc.add_range_file(KEY, &new));
+        assert!(acc.add_range_file(KEY, &old));
+        assert!(acc.subtract_range_file(KEY, &new));
+        assert_eq!(acc.current_delta(), SIZE as i64);
+        assert!(acc.subtract_range_file(KEY, &old));
+        assert_eq!(acc.current_delta(), 0);
+    }
+
+    #[test]
+    fn unversioned_file_accounting_shares_the_shipped_extent_identity() {
+        let (_temp, acc) = accumulator();
+        let range = RangeSpec::new(
+            0,
+            SIZE - 1,
+            "object_0-4095.bin".to_string(),
+            crate::compression::CompressionAlgorithm::Lz4,
+            SIZE,
+            SIZE,
+        );
+
+        assert!(acc.add_range(KEY, 0, SIZE - 1, SIZE));
+        assert!(!acc.add_range_file(KEY, &range));
+        assert!(acc.subtract_range_file(KEY, &range));
+        assert_eq!(acc.current_delta(), 0);
+        assert!(acc.add_range_file(KEY, &range));
+        assert!(acc.subtract_range(KEY, 0, SIZE - 1, SIZE));
+        assert_eq!(acc.current_delta(), 0);
     }
 
     /// The property the re-PUT debit depends on: a range removed through

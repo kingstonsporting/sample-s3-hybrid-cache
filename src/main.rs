@@ -654,10 +654,10 @@ async fn main() -> Result<()> {
                 config.cache.shared_storage.orphan_max_per_cycle
             );
 
-            let orphaned_recovery = Arc::new(OrphanedRangeRecovery::new(
-                config.cache.cache_dir.clone(),
-                writer,
-            ));
+            let orphaned_recovery = Arc::new(
+                OrphanedRangeRecovery::new(config.cache.cache_dir.clone(), writer)
+                    .with_max_metadata_file_bytes(config.cache.max_metadata_file_bytes),
+            );
 
             let recovery_config =
                 BackgroundRecoveryConfig::from_shared_storage_config(&config.cache.shared_storage);

@@ -992,11 +992,27 @@ impl RangeHandler {
         // Get metadata to find the range spec
         let metadata = disk_cache.get_metadata(cache_key).await?;
 
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.object_metadata.etag != range.etag)
+        {
+            return Err(ProxyError::CacheVersionMismatch {
+                cache_key: cache_key.to_string(),
+                cached_etag: metadata.as_ref().unwrap().object_metadata.etag.clone(),
+                response_etag: range.etag.clone(),
+            });
+        }
+
         // Find the matching range spec in metadata
         let range_spec = if let Some(ref meta) = metadata {
+            let version_id = crate::disk_cache::object_version_id(&range.etag);
             meta.ranges
                 .iter()
-                .find(|r| r.start == range.start && r.end == range.end)
+                .find(|r| {
+                    r.start == range.start
+                        && r.end == range.end
+                        && crate::disk_cache::range_file_belongs_to(r, &version_id)
+                })
                 .cloned()
         } else {
             None
@@ -1010,7 +1026,12 @@ impl RangeHandler {
             None => {
                 // Check journals for pending ranges
                 let journal_ranges = disk_cache
-                    .find_pending_journal_ranges(cache_key, range.start, range.end)
+                    .find_pending_journal_ranges(
+                        cache_key,
+                        range.start,
+                        range.end,
+                        Some(&range.etag),
+                    )
                     .await?;
 
                 journal_ranges
@@ -1026,7 +1047,9 @@ impl RangeHandler {
         };
 
         // Load the range data
-        let data = disk_cache.load_range_data(&range_spec).await?;
+        let data = disk_cache
+            .load_range_data_for_version(&range_spec, cache_key, &range.etag)
+            .await?;
 
         // Release the lock before spawning async task
         drop(disk_cache);
@@ -1095,11 +1118,27 @@ impl RangeHandler {
         // Get metadata to find the range spec
         let metadata = disk_cache.get_metadata(cache_key).await?;
 
+        if metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.object_metadata.etag != range.etag)
+        {
+            return Err(ProxyError::CacheVersionMismatch {
+                cache_key: cache_key.to_string(),
+                cached_etag: metadata.as_ref().unwrap().object_metadata.etag.clone(),
+                response_etag: range.etag.clone(),
+            });
+        }
+
         // Find the matching range spec in metadata
         let range_spec = if let Some(ref meta) = metadata {
+            let version_id = crate::disk_cache::object_version_id(&range.etag);
             meta.ranges
                 .iter()
-                .find(|r| r.start == range.start && r.end == range.end)
+                .find(|r| {
+                    r.start == range.start
+                        && r.end == range.end
+                        && crate::disk_cache::range_file_belongs_to(r, &version_id)
+                })
                 .cloned()
         } else {
             None
@@ -1110,7 +1149,12 @@ impl RangeHandler {
             Some(spec) => spec,
             None => {
                 let journal_ranges = disk_cache
-                    .find_pending_journal_ranges(cache_key, range.start, range.end)
+                    .find_pending_journal_ranges(
+                        cache_key,
+                        range.start,
+                        range.end,
+                        Some(&range.etag),
+                    )
                     .await?;
 
                 journal_ranges
@@ -1126,7 +1170,9 @@ impl RangeHandler {
         };
 
         // Load the raw frame bytes (no decompression)
-        let (frame_data, algorithm) = disk_cache.load_range_frame(&range_spec).await?;
+        let (frame_data, algorithm) = disk_cache
+            .load_range_frame_for_version(&range_spec, cache_key, &range.etag)
+            .await?;
 
         debug!(
             "Successfully loaded {} byte frame for range {}-{}",
@@ -2279,11 +2325,30 @@ impl RangeHandler {
         headers: &HashMap<String, String>,
         mut caller_reservation: Option<&mut crate::inflight_ledger::Reservation>,
     ) -> Result<RangeMergeResult> {
-        // Attempt to merge ranges
-        match self
-            .merge_range_segments(cache_key, requested_range, cached_ranges, fetched_ranges)
-            .await
-        {
+        // Cached and fetched segments must all come from one object version. The
+        // object can change between the cache lookup and the sub-fetches.
+        let fetched_etags = fetched_ranges.iter().map(|(_, _, headers)| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+                .map_or("", |(_, value)| value.as_str())
+        });
+        let mut etags = cached_ranges
+            .iter()
+            .map(|range| range.etag.as_str())
+            .chain(fetched_etags);
+        let first_etag = etags.next().unwrap_or_default();
+        let merge = if !first_etag.is_empty() && etags.all(|etag| etag == first_etag) {
+            self.merge_range_segments(cache_key, requested_range, cached_ranges, fetched_ranges)
+                .await
+        } else {
+            Err(ProxyError::CacheVersionMismatch {
+                cache_key: cache_key.to_string(),
+                cached_etag: first_etag.to_string(),
+                response_etag: String::new(),
+            })
+        };
+        match merge {
             Ok(merge_result) => {
                 // Validate merged data size - Requirement 2.5
                 let expected_size = requested_range.end - requested_range.start + 1;
@@ -2317,6 +2382,9 @@ impl RangeHandler {
                 );
                 Ok(merge_result)
             }
+            // The response headers describe the cached version, so a changed
+            // object is answered by forwarding the client's request instead.
+            Err(e @ ProxyError::CacheVersionMismatch { .. }) => Err(e),
             Err(e) => {
                 // Determine error type and log appropriately
                 let error_context = match &e {

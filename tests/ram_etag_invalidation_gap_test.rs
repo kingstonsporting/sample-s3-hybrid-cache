@@ -196,7 +196,7 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
     );
 
     // --- Precondition: both tiers hold version A --------------------------
-    let ram_before = cache_manager.get_range_from_ram_cache(KEY, RANGE_START, RANGE_END);
+    let ram_before = cache_manager.get_range_from_ram_cache(KEY, RANGE_START, RANGE_END, ETAG_A);
     assert_eq!(
         ram_before.as_deref(),
         Some(body.as_slice()),
@@ -329,7 +329,7 @@ async fn etag_invalidation_leaves_stale_ram_range_readable() {
     // the ETag-mismatch arm through `CacheManager::invalidate_cache_hierarchy`
     // (which already calls `remove_from_ram_cache_unified`) instead of calling
     // `DiskCacheManager::invalidate_all_ranges` directly.
-    let ram_after = cache_manager.get_range_from_ram_cache(KEY, RANGE_START, RANGE_END);
+    let ram_after = cache_manager.get_range_from_ram_cache(KEY, RANGE_START, RANGE_END, ETAG_A);
     assert!(
         ram_after.is_none(),
         "DEFECT: the ETag-mismatch arm fired and every disk trace of version A is \

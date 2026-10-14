@@ -52,9 +52,12 @@ fn build_body(size: usize) -> Vec<u8> {
         .collect()
 }
 
+/// ETag of the simulated object; it names the committed range file.
+const TEST_ETAG: &str = "test-etag-e2e";
+
 fn test_object_metadata(content_length: u64) -> ObjectMetadata {
     ObjectMetadata {
-        etag: "test-etag-e2e".to_string(),
+        etag: TEST_ETAG.to_string(),
         last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
         content_length,
         content_type: Some("application/octet-stream".to_string()),
@@ -149,7 +152,7 @@ async fn assert_cached_range_matches(
 ) {
     // Resolve the `.bin` path the way the writer would, and read back the
     // compressed file size so we can build a RangeSpec for load_range_data.
-    let final_bin_path = disk_cache.get_new_range_file_path(cache_key, start, end);
+    let final_bin_path = disk_cache.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
     let ranges_dir = cache_dir.join("ranges");
     let relative_path = final_bin_path
         .strip_prefix(&ranges_dir)

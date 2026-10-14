@@ -237,7 +237,8 @@ async fn test_inconsistent_metadata_handling() {
     assert_eq!(metadata.ranges.len(), 2, "Should have 2 ranges");
 
     // Delete one range file manually (simulate corruption/inconsistency)
-    let range_file_path = cache_manager.get_new_range_file_path(cache_key, 1024, 2047);
+    let range_file_path =
+        cache_manager.get_versioned_range_file_path(cache_key, 1024, 2047, "test-etag");
     std::fs::remove_file(&range_file_path).unwrap();
 
     // Verify and fix metadata
@@ -302,7 +303,8 @@ async fn test_all_ranges_missing() {
     assert!(metadata_file_path.exists(), "Metadata file should exist");
 
     // Delete the range file manually
-    let range_file_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
+    let range_file_path =
+        cache_manager.get_versioned_range_file_path(cache_key, 0, 1023, "test-etag");
     std::fs::remove_file(&range_file_path).unwrap();
 
     // Verify and fix metadata - should delete entire entry
@@ -411,7 +413,8 @@ async fn test_comprehensive_cache_cleanup() {
     std::fs::write(&temp_range_file, b"temp data").unwrap();
 
     // Delete one range file to create inconsistency
-    let range_file_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
+    let range_file_path =
+        cache_manager.get_versioned_range_file_path(cache_key, 0, 1023, "test-etag");
     std::fs::remove_file(&range_file_path).unwrap();
 
     // Perform comprehensive cleanup
@@ -614,7 +617,8 @@ async fn test_partial_write_cleanup() {
     assert_eq!(metadata.ranges[0].end, 2047, "New range should end at 2047");
 
     // Verify old range file was cleaned up
-    let old_range_path = cache_manager.get_new_range_file_path(cache_key, 0, 1023);
+    let old_range_path =
+        cache_manager.get_versioned_range_file_path(cache_key, 0, 1023, "test-etag");
     assert!(
         !old_range_path.exists(),
         "Old range file should be deleted after ETag mismatch invalidation"

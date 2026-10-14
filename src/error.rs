@@ -19,6 +19,13 @@ pub enum ProxyError {
     #[error("Cache error: {0}")]
     CacheError(String),
 
+    #[error("Cache object version mismatch: key={cache_key}, cached_etag={cached_etag}, response_etag={response_etag}")]
+    CacheVersionMismatch {
+        cache_key: String,
+        cached_etag: String,
+        response_etag: String,
+    },
+
     /// A cache repair path was asked to rewrite a request header that the client
     /// covered with its SigV4 signature. Doing so would turn a valid client request
     /// into an upstream `SignatureDoesNotMatch`, so the repair is refused and the

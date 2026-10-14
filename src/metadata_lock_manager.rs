@@ -6,9 +6,12 @@
 use crate::{ProxyError, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for lock acquisition with retry
@@ -308,6 +311,8 @@ pub struct MetadataLock {
     acquired_at: SystemTime,
     /// Fence epoch written at acquisition time (for verification)
     fence_epoch: u64,
+    // Drop after the file handle so a local waiter cannot open the old inode.
+    local_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl MetadataLock {
@@ -319,6 +324,7 @@ impl MetadataLock {
             cache_key,
             acquired_at: SystemTime::now(),
             fence_epoch,
+            local_guard: None,
         }
     }
 
@@ -437,6 +443,12 @@ impl Drop for MetadataLock {
     }
 }
 
+#[derive(Default)]
+struct LocalLocks {
+    queues: HashMap<String, Weak<AsyncMutex<()>>>,
+    insertions: usize,
+}
+
 /// Enhanced metadata lock manager with stale lock detection and process validation
 pub struct MetadataLockManager {
     /// Cache directory path
@@ -455,6 +467,8 @@ pub struct MetadataLockManager {
     hostname: String,
     /// Cross-host metadata lock timeout in milliseconds (Req 3.3)
     metadata_lock_timeout_ms: u64,
+    // Weak entries retain only active queues; prune idle keys in bounded batches.
+    local_locks: Mutex<LocalLocks>,
 }
 
 impl MetadataLockManager {
@@ -472,6 +486,7 @@ impl MetadataLockManager {
             max_backoff: Duration::from_secs(5),
             hostname,
             metadata_lock_timeout_ms: 30_000, // default 30s
+            local_locks: Mutex::new(LocalLocks::default()),
         }
     }
 
@@ -494,10 +509,14 @@ impl MetadataLockManager {
             max_backoff: Duration::from_secs(5),
             hostname,
             metadata_lock_timeout_ms,
+            local_locks: Mutex::new(LocalLocks::default()),
         }
     }
     /// Acquire an exclusive metadata lock with stale lock detection and exponential backoff
     pub async fn acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
+        // Queue local contenders instead of making short critical sections pay
+        // the filesystem lock's cross-process exponential retry delays.
+        let local_guard = self.local_lock(cache_key).lock_owned().await;
         let lock_file_path = self.get_lock_file_path(cache_key)?;
         let mut attempt = 0;
 
@@ -513,7 +532,8 @@ impl MetadataLockManager {
 
         while attempt <= self.max_retries {
             match self.try_acquire_lock_once(cache_key, &lock_file_path).await {
-                Ok(lock) => {
+                Ok(mut lock) => {
+                    lock.local_guard = Some(local_guard);
                     debug!(
                         "Successfully acquired metadata lock: cache_key={}, attempt={}, path={:?}",
                         cache_key,
@@ -554,6 +574,10 @@ impl MetadataLockManager {
     /// with exponential backoff. Used by journal consolidation where skipping a
     /// contended key and retrying next cycle is cheaper than waiting.
     pub async fn try_acquire_lock(&self, cache_key: &str) -> Result<MetadataLock> {
+        let local_guard = self
+            .local_lock(cache_key)
+            .try_lock_owned()
+            .map_err(|_| ProxyError::CacheError(format!("Metadata lock held: {}", cache_key)))?;
         let lock_file_path = self.get_lock_file_path(cache_key)?;
 
         // Ensure parent directory exists
@@ -566,7 +590,28 @@ impl MetadataLockManager {
             })?;
         }
 
-        self.try_acquire_lock_once(cache_key, &lock_file_path).await
+        let mut lock = self
+            .try_acquire_lock_once(cache_key, &lock_file_path)
+            .await?;
+        lock.local_guard = Some(local_guard);
+        Ok(lock)
+    }
+
+    fn local_lock(&self, cache_key: &str) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.local_locks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lock) = locks.queues.get(cache_key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        locks.insertions += 1;
+        if locks.insertions >= 1024 {
+            locks.queues.retain(|_, lock| lock.strong_count() > 0);
+            locks.insertions = 0;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks
+            .queues
+            .insert(cache_key.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Try to acquire lock once (internal method)
@@ -1109,6 +1154,47 @@ fn is_process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn local_waiters_acquire_without_filesystem_retries() {
+        let temp = TempDir::new().unwrap();
+        let manager = Arc::new(MetadataLockManager::new(
+            temp.path().to_path_buf(),
+            Duration::from_secs(1),
+            0,
+        ));
+        let first = manager.acquire_lock("bucket/object").await.unwrap();
+        assert!(manager.try_acquire_lock("bucket/object").await.is_err());
+        let other = manager.acquire_lock("bucket/other").await.unwrap();
+        drop(other);
+        let queued_manager = manager.clone();
+        let waiter =
+            tokio::spawn(async move { queued_manager.acquire_lock("bucket/object").await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.cache_key(), "bucket/object");
+    }
+
+    #[test]
+    fn local_queue_retention_tracks_active_keys_and_a_bounded_idle_batch() {
+        let temp = TempDir::new().unwrap();
+        let manager = MetadataLockManager::new(temp.path().to_path_buf(), Duration::ZERO, 0);
+        let active: Vec<_> = (0..2048)
+            .map(|i| manager.local_lock(&format!("bucket/{i}")))
+            .collect();
+        assert_eq!(manager.local_locks.lock().unwrap().queues.len(), 2048);
+        drop(active);
+        for i in 2048..4096 {
+            drop(manager.local_lock(&format!("bucket/{i}")));
+        }
+        assert!(manager.local_locks.lock().unwrap().queues.len() <= 1024);
+    }
 
     #[test]
     fn test_lock_file_content_creation() {

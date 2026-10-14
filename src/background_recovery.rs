@@ -676,9 +676,9 @@ impl BackgroundRecoverySystem {
             }
 
             for orphan in orphans {
-                // Skip orphans that don't meet minimum criteria
-                if orphan.validation_status != ValidationStatus::Valid {
-                    debug!("Skipping invalid orphan: {:?}", orphan.range_file_path);
+                // Unknown identity cannot authorize recovery or deletion.
+                if orphan.validation_status == ValidationStatus::Unknown {
+                    debug!("Skipping unknown orphan: {:?}", orphan.range_file_path);
                     continue;
                 }
 
@@ -1053,6 +1053,48 @@ mod tests {
         assert_eq!(status.medium_priority_count, 0);
         assert_eq!(status.low_priority_count, 0);
         assert_eq!(status.processing_count, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_includes_invalid_and_corrupted_orphans_for_cleanup_but_skips_unknown() {
+        let key = "bucket/form.parquet";
+        let orphans = [
+            ValidationStatus::Valid,
+            ValidationStatus::Invalid,
+            ValidationStatus::Corrupted,
+            ValidationStatus::Unknown,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, validation_status)| OrphanedRange {
+            cache_key: key.to_string(),
+            range_file_path: PathBuf::from(format!("range-{index}.bin")),
+            range_spec: None,
+            validation_status,
+            access_frequency: 80,
+            last_accessed: Some(SystemTime::now()),
+            file_size: 512,
+        })
+        .collect();
+        let queue = Arc::new(RwLock::new(RecoveryQueue::default()));
+        BackgroundRecoverySystem::queue_orphans_for_recovery(
+            HashMap::from([(key.to_string(), orphans)]),
+            &BackgroundRecoveryConfig::default(),
+            &queue,
+        )
+        .await;
+        let queued = queue.read().await;
+        let statuses: Vec<_> = queued
+            .high_priority
+            .iter()
+            .chain(&queued.medium_priority)
+            .chain(&queued.low_priority)
+            .map(|entry| entry.orphan.validation_status.clone())
+            .collect();
+        assert_eq!(statuses.len(), 3);
+        assert!(statuses.contains(&ValidationStatus::Valid));
+        assert!(statuses.contains(&ValidationStatus::Invalid));
+        assert!(statuses.contains(&ValidationStatus::Corrupted));
     }
 
     #[tokio::test]

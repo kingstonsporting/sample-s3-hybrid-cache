@@ -256,6 +256,7 @@ async fn multi_range_request_resolves_settings_exactly_once() {
     let stub = StubS3Client::new().with_default(
         StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
             .with_body(Bytes::from(vec![0xCDu8; 100]))
+            .with_header("etag", ETAG)
             .with_header("content-range", format!("bytes 0-99/{}", OBJECT_SIZE)),
     );
     let s3_client = stub.clone().into_trait_object();
@@ -317,11 +318,11 @@ async fn multi_range_request_resolves_settings_exactly_once() {
     loop {
         let dc = disk_cache_manager.read().await;
         let front = dc
-            .find_pending_journal_ranges(&cache_key, 0, CACHED_START - 1)
+            .find_pending_journal_ranges(&cache_key, 0, CACHED_START - 1, Some(ETAG))
             .await
             .expect("poll journal front range");
         let back = dc
-            .find_pending_journal_ranges(&cache_key, CACHED_END + 1, OBJECT_SIZE - 1)
+            .find_pending_journal_ranges(&cache_key, CACHED_END + 1, OBJECT_SIZE - 1, Some(ETAG))
             .await
             .expect("poll journal back range");
         drop(dc);

@@ -349,13 +349,38 @@ async fn create_test_consolidator(
     consolidator
 }
 
+/// The object version every fixture range belongs to.
+const TEST_ETAG: &str = "\"size-tracking-etag\"";
+
+/// Path of a fixture range file relative to `ranges/`, named for `TEST_ETAG`.
+fn range_file_relative_path(cache_key: &str, start: u64, end: u64) -> std::path::PathBuf {
+    s3_proxy::disk_cache::get_sharded_path(
+        std::path::Path::new(""),
+        cache_key,
+        &format!(
+            "_{}-{}.{}.bin",
+            start,
+            end,
+            s3_proxy::disk_cache::object_version_id(TEST_ETAG)
+        ),
+    )
+    .unwrap()
+}
+
 /// Helper to create a test RangeSpec
-fn create_test_range_spec(start: u64, end: u64, compressed_size: u64) -> RangeSpec {
+fn create_test_range_spec(
+    cache_key: &str,
+    start: u64,
+    end: u64,
+    compressed_size: u64,
+) -> RangeSpec {
     let now = SystemTime::now();
     RangeSpec {
         start,
         end,
-        file_path: format!("test_{}_{}.bin", start, end),
+        file_path: range_file_relative_path(cache_key, start, end)
+            .to_string_lossy()
+            .into_owned(),
         compression_algorithm: CompressionAlgorithm::Lz4,
         compressed_size,
         uncompressed_size: compressed_size,
@@ -379,14 +404,22 @@ fn create_test_journal_entry(
         timestamp: SystemTime::now(),
         instance_id: instance_id.to_string(),
         cache_key: cache_key.to_string(),
-        range_spec: create_test_range_spec(start, end, compressed_size),
+        range_spec: create_test_range_spec(cache_key, start, end, compressed_size),
         operation,
-        range_file_path: format!("ranges/test_{}_{}.bin", start, end),
+        range_file_path: format!(
+            "ranges/{}",
+            range_file_relative_path(cache_key, start, end).display()
+        ),
         metadata_version: 1,
         new_ttl_secs: None,
         object_ttl_secs: None,
         access_increment: None,
-        object_metadata: None,
+        object_metadata: Some(s3_proxy::cache_types::ObjectMetadata::new(
+            TEST_ETAG.to_string(),
+            String::new(),
+            end + 1,
+            None,
+        )),
     }
 }
 
@@ -415,13 +448,9 @@ async fn create_range_file(
     end: u64,
     size: u64,
 ) {
-    let range_base_dir = cache_dir.join("ranges");
-    let range_path = s3_proxy::disk_cache::get_sharded_path(
-        &range_base_dir,
-        cache_key,
-        &format!("_{}-{}.bin", start, end),
-    )
-    .unwrap();
+    let range_path = cache_dir
+        .join("ranges")
+        .join(range_file_relative_path(cache_key, start, end));
 
     if let Some(parent) = range_path.parent() {
         tokio::fs::create_dir_all(parent).await.unwrap();

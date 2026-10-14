@@ -32,10 +32,94 @@ pub struct JournalEntry {
     /// Access count increment (for AccessUpdate operation)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_increment: Option<u64>,
-    /// Object metadata from S3 response (for Add operations when .meta doesn't exist yet)
-    /// Contains response_headers needed for serving cached responses with correct headers
+    /// Originating S3 object identity and response headers for Add/Update bytes.
+    /// Required to attach a range to metadata with a known ETag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<crate::cache_types::ObjectMetadata>,
+}
+
+impl JournalEntry {
+    /// Range bytes and version-qualified removals belong to their originating object.
+    /// Operations without range data do not change the object's identity.
+    pub fn matches_object_version(&self, etag: &str) -> bool {
+        entry_matches_object_version(
+            &self.operation,
+            &self.range_spec,
+            self.object_metadata
+                .as_ref()
+                .map(|object| object.etag.as_str()),
+            etag,
+        )
+    }
+}
+
+/// The fields a pending-range lookup reads. serde skips the rest of the entry,
+/// including the object's response headers, without building it.
+#[derive(Deserialize)]
+pub(crate) struct PendingRangeView {
+    pub cache_key: String,
+    pub operation: JournalOperation,
+    pub range_spec: RangeSpec,
+    #[serde(default)]
+    object_metadata: Option<ObjectEtag>,
+}
+
+#[derive(Deserialize)]
+struct ObjectEtag {
+    #[serde(default)]
+    etag: String,
+}
+
+impl PendingRangeView {
+    pub fn matches_object_version(&self, etag: &str) -> bool {
+        entry_matches_object_version(
+            &self.operation,
+            &self.range_spec,
+            self.object_metadata
+                .as_ref()
+                .map(|object| object.etag.as_str()),
+            etag,
+        )
+    }
+}
+
+fn entry_matches_object_version(
+    operation: &JournalOperation,
+    range_spec: &RangeSpec,
+    entry_etag: Option<&str>,
+    etag: &str,
+) -> bool {
+    let version_id = crate::disk_cache::object_version_id(etag);
+    match operation {
+        JournalOperation::Remove => {
+            range_file_version(&range_spec.file_path).is_none_or(|version| version == version_id)
+        }
+        // The file name is the bytes' identity; unversioned bytes have none.
+        JournalOperation::Add | JournalOperation::Update => {
+            crate::disk_cache::range_file_belongs_to(range_spec, &version_id)
+                && entry_etag.is_none_or(|entry_etag| entry_etag == etag)
+        }
+        _ => true,
+    }
+}
+
+/// Each journal line is one serialized `JournalEntry`, holding `cache_key`
+/// exactly as `serde_json` encodes it. A line without that encoding cannot belong
+/// to the key, so per-key readers skip it without parsing.
+pub(crate) fn encoded_cache_key(cache_key: &str) -> String {
+    serde_json::to_string(cache_key).expect("a string always serializes")
+}
+
+pub(crate) fn range_file_version(file_path: &str) -> Option<&str> {
+    Path::new(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".bin"))
+        .and_then(|stem| stem.rsplit_once('.'))
+        .map(|(_, version)| version)
+        .filter(|version| {
+            version.len() == 64 && version.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// Types of journal operations
@@ -627,8 +711,9 @@ impl JournalManager {
             .map_err(|e| ProxyError::CacheError(format!("Failed to read journal file: {}", e)))?;
 
         let mut entries = Vec::new();
+        let encoded_key = encoded_cache_key(cache_key);
         for line in content.lines() {
-            if line.trim().is_empty() {
+            if line.trim().is_empty() || !line.contains(&encoded_key) {
                 continue;
             }
             match serde_json::from_str::<JournalEntry>(line) {
@@ -819,12 +904,13 @@ impl JournalManager {
         journal_files: &[std::path::PathBuf],
     ) -> Result<Vec<JournalEntry>> {
         let mut all_entries = Vec::new();
+        let encoded_key = encoded_cache_key(cache_key);
 
         for journal_file in journal_files {
             match tokio::fs::read_to_string(journal_file).await {
                 Ok(content) => {
                     for line in content.lines() {
-                        if line.trim().is_empty() {
+                        if line.trim().is_empty() || !line.contains(&encoded_key) {
                             continue;
                         }
                         match serde_json::from_str::<JournalEntry>(line) {
@@ -868,6 +954,7 @@ impl JournalManager {
         cache_key: &str,
     ) -> Result<Vec<JournalEntry>> {
         let mut all_entries = Vec::new();
+        let encoded_key = encoded_cache_key(cache_key);
 
         // Read from all per-instance journal files
         let journal_files = self.find_all_journal_files(cache_key).await?;
@@ -875,7 +962,7 @@ impl JournalManager {
             match tokio::fs::read_to_string(journal_file).await {
                 Ok(content) => {
                     for line in content.lines() {
-                        if line.trim().is_empty() {
+                        if line.trim().is_empty() || !line.contains(&encoded_key) {
                             continue;
                         }
                         match serde_json::from_str::<JournalEntry>(line) {

@@ -49,6 +49,7 @@ use s3_proxy::cache_types::{
 };
 use s3_proxy::compression::CompressionAlgorithm;
 use s3_proxy::config::Config;
+use s3_proxy::disk_cache::{object_version_id, range_file_belongs_to};
 use s3_proxy::http_proxy::HttpProxy;
 use s3_proxy::inflight_tracker::InFlightTracker;
 use s3_proxy::range_handler::RangeHandler;
@@ -300,17 +301,31 @@ impl Fixture {
         }
     }
 
-    fn bin_relative(cache_key: &str, start: u64, end: u64) -> String {
+    /// Range files are named for the object version they hold: readers only
+    /// trust a range whose file carries the version of the `.meta`'s ETag.
+    fn bin_relative(cache_key: &str, start: u64, end: u64, etag: &str) -> String {
         let safe = cache_key.replace(['/', ':'], "_");
-        format!("bucket/00/000/{}_{}-{}.bin", safe, start, end)
+        format!(
+            "bucket/00/000/{}_{}-{}.{}.bin",
+            safe,
+            start,
+            end,
+            object_version_id(etag)
+        )
     }
 
-    /// Absolute path of a seeded extent's range file.
+    /// Absolute path of a seeded extent's range file, named for the version the
+    /// `.meta` records.
     pub fn bin_path(&self, cache_key: &str, start: u64, end: u64) -> std::path::PathBuf {
+        let etag = self
+            .read_meta(cache_key)
+            .expect("bin_path needs the seeded .meta")
+            .object_metadata
+            .etag;
         self.cache_manager
             .get_cache_dir()
             .join("ranges")
-            .join(Self::bin_relative(cache_key, start, end))
+            .join(Self::bin_relative(cache_key, start, end, &etag))
     }
 
     pub fn meta_path(&self, cache_key: &str) -> std::path::PathBuf {
@@ -355,7 +370,7 @@ impl Fixture {
         let mut range_specs = Vec::new();
         for (start, end) in spec.extents.iter().copied() {
             let body = vec![OLD_FILL; (end - start + 1) as usize];
-            let relative = Self::bin_relative(cache_key, start, end);
+            let relative = Self::bin_relative(cache_key, start, end, &spec.etag);
             let path = self
                 .cache_manager
                 .get_cache_dir()
@@ -443,6 +458,7 @@ impl Fixture {
             !metadata.ranges.is_empty(),
             "PRECONDITION MISSING: .meta records no ranges, so there is no candidate coverage"
         );
+        let version_id = object_version_id(&metadata.object_metadata.etag);
         for r in &metadata.ranges {
             let bin = self
                 .cache_manager
@@ -453,6 +469,12 @@ impl Fixture {
                 bin.exists(),
                 "PRECONDITION MISSING: range file absent at {:?}; Candidate_Available is false",
                 bin
+            );
+            assert!(
+                range_file_belongs_to(r, &version_id),
+                "PRECONDITION MISSING: range file {:?} is not named for the stored ETag, so \
+                 readers never trust it; Candidate_Available is false",
+                r.file_path
             );
         }
 

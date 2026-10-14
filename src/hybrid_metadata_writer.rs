@@ -44,6 +44,7 @@ impl ConsolidationTrigger {
 }
 
 /// Hybrid metadata writer combining immediate updates with journaling
+#[derive(Clone)]
 pub struct HybridMetadataWriter {
     cache_dir: PathBuf,
     lock_manager: Arc<MetadataLockManager>,
@@ -66,14 +67,38 @@ impl HybridMetadataWriter {
             consolidation_trigger,
         }
     }
+
+    /// Serializes object identity changes and range file publication/opening.
+    pub async fn acquire_metadata_lock(&self, cache_key: &str) -> Result<MetadataLock> {
+        self.lock_manager.acquire_lock(cache_key).await
+    }
+
+    pub(crate) async fn has_pending_range_file(
+        &self,
+        cache_key: &str,
+        relative_path: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .journal_manager
+            .get_all_entries_for_cache_key(cache_key)
+            .await?
+            .iter()
+            .any(|entry| {
+                matches!(
+                    entry.operation,
+                    JournalOperation::Add | JournalOperation::Update
+                ) && entry.range_spec.file_path == relative_path
+            }))
+    }
+
     /// Write range metadata using the specified write mode
     ///
     /// # Arguments
     /// * `cache_key` - The cache key for the object
     /// * `range_spec` - The range specification to write
     /// * `write_mode` - The write mode (Immediate, JournalOnly, or Hybrid)
-    /// * `object_metadata` - Optional object metadata from S3 response (needed for JournalOnly mode
-    ///   when .meta file doesn't exist yet, to preserve response_headers)
+    /// * `object_metadata` - Originating S3 object identity and response headers.
+    ///   Required to attach range bytes to metadata with a known ETag in any mode.
     pub async fn write_range_metadata(
         &mut self,
         cache_key: &str,
@@ -88,12 +113,18 @@ impl HybridMetadataWriter {
         );
 
         match write_mode {
-            WriteMode::Immediate => self.write_immediate_only(cache_key, range_spec, ttl).await,
+            WriteMode::Immediate => {
+                self.write_immediate_only(cache_key, range_spec, object_metadata.as_ref(), ttl)
+                    .await
+            }
             WriteMode::JournalOnly => {
                 self.write_journal_only(cache_key, range_spec, object_metadata, ttl)
                     .await
             }
-            WriteMode::Hybrid => self.write_hybrid(cache_key, range_spec, ttl).await,
+            WriteMode::Hybrid => {
+                self.write_hybrid(cache_key, range_spec, object_metadata, ttl)
+                    .await
+            }
         }
     }
 
@@ -125,10 +156,11 @@ impl HybridMetadataWriter {
                 .await;
         } else {
             let file_path = format!(
-                "{}_{}-{}.bin",
+                "{}_{}-{}.{}.bin",
                 sanitize_cache_key_for_filename(cache_key),
                 0,
-                object_metadata.content_length.saturating_sub(1)
+                object_metadata.content_length.saturating_sub(1),
+                crate::disk_cache::object_version_id(&object_metadata.etag)
             );
             // Live write path, so membership is recorded explicitly (R12.2).
             // Spec: write-cache-accounting-and-eviction. Requirements: 12.2
@@ -193,6 +225,7 @@ impl HybridMetadataWriter {
         &mut self,
         cache_key: &str,
         range_spec: RangeSpec,
+        object_metadata: Option<&ObjectMetadata>,
         ttl: std::time::Duration,
     ) -> Result<()> {
         let lock = match self.lock_manager.acquire_lock(cache_key).await {
@@ -221,6 +254,27 @@ impl HybridMetadataWriter {
                 return Err(e);
             }
         };
+
+        // Orphaned bytes have no object identity. Attaching them to a known
+        // version would let recovery undo the journal's version rejection.
+        let response_etag = object_metadata
+            .map(|object| object.etag.as_str())
+            .unwrap_or_default();
+        if !metadata.object_metadata.etag.is_empty()
+            && metadata.object_metadata.etag != response_etag
+        {
+            return Err(ProxyError::CacheVersionMismatch {
+                cache_key: cache_key.to_string(),
+                cached_etag: metadata.object_metadata.etag,
+                response_etag: response_etag.to_string(),
+            });
+        }
+        if let Some(object) = object_metadata {
+            if metadata.object_metadata.etag.is_empty() && !object.etag.is_empty() {
+                metadata.ranges.clear();
+                metadata.object_metadata = object.clone();
+            }
+        }
 
         // Add or update range
         self.add_or_update_range(&mut metadata, range_spec);
@@ -252,8 +306,8 @@ impl HybridMetadataWriter {
     /// # Arguments
     /// * `cache_key` - The cache key for the object
     /// * `range_spec` - The range specification to write
-    /// * `object_metadata` - Optional object metadata from S3 response (needed when .meta file
-    ///   doesn't exist yet, to preserve response_headers for serving cached responses)
+    /// * `object_metadata` - Originating S3 object identity and response headers,
+    ///   used to verify the range's version during journal lookup and consolidation.
     async fn write_journal_only(
         &mut self,
         cache_key: &str,
@@ -299,7 +353,11 @@ impl HybridMetadataWriter {
             }
         }
 
-        // Check if immediate consolidation should be triggered
+        // The pending-entry read below only feeds a debug line, and it parses
+        // every pending entry for the key on each append.
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return Ok(());
+        }
         let pending_entries = match self.journal_manager.get_pending_entries(cache_key).await {
             Ok(entries) => entries,
             Err(e) => {
@@ -331,11 +389,12 @@ impl HybridMetadataWriter {
         &mut self,
         cache_key: &str,
         range_spec: RangeSpec,
+        object_metadata: Option<ObjectMetadata>,
         ttl: std::time::Duration,
     ) -> Result<()> {
         // Try immediate write first
         match self
-            .write_immediate_only(cache_key, range_spec.clone(), ttl)
+            .write_immediate_only(cache_key, range_spec.clone(), object_metadata.as_ref(), ttl)
             .await
         {
             Ok(()) => {
@@ -351,7 +410,7 @@ impl HybridMetadataWriter {
                     new_ttl_secs: None,
                     object_ttl_secs: Some(ttl.as_secs()),
                     access_increment: None,
-                    object_metadata: None, // Not needed in hybrid mode - immediate write already created .meta
+                    object_metadata,
                 };
 
                 // Journal write failure is not critical in hybrid mode since immediate write succeeded
@@ -374,6 +433,7 @@ impl HybridMetadataWriter {
 
                 Ok(())
             }
+            Err(e @ ProxyError::CacheVersionMismatch { .. }) => Err(e),
             Err(e) => {
                 warn!(
                     "Immediate write failed in hybrid mode, falling back to journal-only: cache_key={}, error={}",
@@ -381,9 +441,8 @@ impl HybridMetadataWriter {
                 );
 
                 // Fall back to journal-only with proper error handling
-                // Note: In hybrid fallback, we don't have object_metadata since immediate write failed
                 match self
-                    .write_journal_only(cache_key, range_spec, None, ttl)
+                    .write_journal_only(cache_key, range_spec, object_metadata, ttl)
                     .await
                 {
                     Ok(()) => {
@@ -485,7 +544,7 @@ impl HybridMetadataWriter {
     }
 
     /// Write metadata to disk atomically with enhanced error handling
-    async fn write_metadata_to_disk(
+    pub(crate) async fn write_metadata_to_disk(
         &self,
         metadata: &NewCacheMetadata,
         _lock: &MetadataLock,

@@ -117,9 +117,12 @@ fn expand_input(data_seed: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// ETag of every object these properties store; it names the published range files.
+const TEST_ETAG: &str = "test-etag";
+
 fn test_object_metadata(len: u64) -> ObjectMetadata {
     ObjectMetadata {
-        etag: "test-etag".to_string(),
+        etag: TEST_ETAG.to_string(),
         last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
         content_length: len,
         content_type: Some("application/octet-stream".to_string()),
@@ -199,7 +202,8 @@ fn prop_batched_write_byte_identity() {
             }
 
             // Build a RangeSpec from the committed .bin file; read it back.
-            let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let final_path =
+                cache_manager.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
             let ranges_dir = temp_dir.path().join("ranges");
             let relative_path = final_path
                 .strip_prefix(&ranges_dir)
@@ -332,8 +336,10 @@ fn prop_batched_write_equivalence_to_single_shot() {
             }
 
             // --- Read both committed files and decompress ---
-            let incr_bin_path = incr_cache.get_new_range_file_path(cache_key, start, end);
-            let shot_bin_path = shot_cache.get_new_range_file_path(cache_key, start, end);
+            let incr_bin_path =
+                incr_cache.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
+            let shot_bin_path =
+                shot_cache.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
 
             let incr_compressed = match std::fs::read(&incr_bin_path) {
                 Ok(d) => d,
@@ -510,7 +516,8 @@ fn prop_residual_flush_on_commit() {
                 return TestResult::error(format!("commit_incremental_range failed: {}", e));
             }
 
-            let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let final_path =
+                cache_manager.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
             let ranges_dir = temp_dir.path().join("ranges");
             let relative_path = final_path
                 .strip_prefix(&ranges_dir)
@@ -643,7 +650,7 @@ async fn test_residual_flush_100k_bytes_64k_batch() {
         .await
         .unwrap();
 
-    let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+    let final_path = cache_manager.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
     let bin_len = std::fs::metadata(&final_path).unwrap().len();
     assert!(
         bin_len > pre_commit_compressed,
@@ -708,7 +715,7 @@ async fn test_residual_flush_3mib_plus_1_byte_at_1mib_batch() {
         .await
         .unwrap();
 
-    let final_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+    let final_path = cache_manager.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
     let ranges_dir = temp_dir.path().join("ranges");
     let relative_path = final_path
         .strip_prefix(&ranges_dir)

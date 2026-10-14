@@ -60,9 +60,12 @@ fn split_into_chunks(data: &[u8], split_seeds: &[u8]) -> Vec<Vec<u8>> {
     chunks
 }
 
+/// ETag of every object these properties store; it names the published range files.
+const TEST_ETAG: &str = "test-etag-preservation";
+
 fn make_object_metadata(content_length: u64) -> ObjectMetadata {
     ObjectMetadata {
-        etag: "test-etag-preservation".to_string(),
+        etag: TEST_ETAG.to_string(),
         last_modified: "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
         content_length,
         content_type: Some("application/octet-stream".to_string()),
@@ -155,7 +158,8 @@ fn prop_store_range_produces_valid_bin_file() {
             }
 
             // Verify .bin file exists
-            let bin_path = cache_manager.get_new_range_file_path(cache_key, start, end);
+            let bin_path =
+                cache_manager.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
             if !bin_path.exists() {
                 return TestResult::error(format!(
                     "Expected .bin file at {:?} but it does not exist",
@@ -346,8 +350,10 @@ fn prop_single_task_incremental_equivalent_to_store_range() {
             }
 
             // --- Read and decompress both .bin files ---
-            let incr_bin_path = incr_cache.get_new_range_file_path(cache_key, start, end);
-            let shot_bin_path = shot_cache.get_new_range_file_path(cache_key, start, end);
+            let incr_bin_path =
+                incr_cache.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
+            let shot_bin_path =
+                shot_cache.get_versioned_range_file_path(cache_key, start, end, TEST_ETAG);
 
             let incr_compressed = match std::fs::read(&incr_bin_path) {
                 Ok(d) => d,
