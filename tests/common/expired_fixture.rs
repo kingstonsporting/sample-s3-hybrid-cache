@@ -786,17 +786,9 @@ pub async fn proxy_get(
 /// A SigV4 `Authorization` whose `SignedHeaders` does **not** include `range`.
 ///
 /// This is the realistic shape for a plain GET — a client does not sign a header it
-/// is not sending — and it matters because at least one path branches on it. The
-/// full-object partial-merge path synthesises a `Range` to fetch only the missing
-/// bytes, and refuses to do so when `range` is signed, since adding the header would
-/// invalidate the client's signature.
-///
-/// That is not hypothetical: the first version of
-/// `expired_partial_coverage_full_object_merge_is_pinned_to_the_cached_etag` used
-/// [`signed_range_authorization`] and the merge path was never entered at all. The
-/// captured request carried neither `range` nor `if-match`, which is what exposed it.
-/// A test that had asserted only on the response body would have passed while
-/// measuring the plain-forward path instead.
+/// is not sending — and it matters because the proxy may rewrite only headers that
+/// are not signed. A test of what a plain GET forwards needs this shape, or it
+/// measures the signed-header guard instead.
 pub fn signed_authorization_without_range() -> String {
     "AWS4-HMAC-SHA256 \
      Credential=AKIAIOSFODNN7EXAMPLE/20260830/us-west-2/s3/aws4_request, \

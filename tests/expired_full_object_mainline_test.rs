@@ -326,39 +326,30 @@ async fn mode_b_if_match_serves_expired_entry_from_cache_without_revalidating() 
     );
 }
 
-/// R1.2 / R7.11: the full-object **partial**-coverage path is a serve of expired
-/// cached bytes, and it must hold an authority.
+/// R1.2 / R7.11: a full-object GET with **partial** coverage of an expired entry
+/// serves no cached bytes; it forwards the client's request unchanged.
 ///
-/// # Why this test exists — a reachability change, not a new feature
+/// Making the full-object lookup a `RevalidationCandidate` made a Stored_Expired
+/// entry's partial coverage visible to this arm. It once answered by synthesizing
+/// `Range: bytes=0-{cached_size-1}` to fetch only the gaps, pinned with `If-Match`.
+/// After an overwrite that pin earned a `412`, the retry kept the synthesized
+/// Range, and a larger object came back truncated at the cached size (production
+/// 2026-10-15; `stale_range_after_overwrite_e2e.rs`). The arm now forwards the
+/// client's own request, so no cached fraction is served and no authority is
+/// needed for one.
 ///
-/// Making the full-object lookup a `RevalidationCandidate` changed which arm a
-/// Stored_Expired entry with *partial* coverage lands in. Before, stored expiry
-/// emptied the overlap, `cached_bytes` came out 0, the 10%-cached gate failed, and
-/// the request became an ordinary full refetch. Now the overlap is non-empty and the
-/// request takes the partial-merge path — which **serves the cached fraction** and
-/// fetches only the gaps.
-///
-/// That is a cached serve of expired bytes, so R1.2 requires an authority for it.
-/// There is one, and it is neither live TTL nor a `304`: the merge path injects
-/// `If-Match` on the cached ETag before fetching the gaps
-/// (`build_conditional_headers_for_range`), so S3 answers `412` if the object has
-/// changed and the cached fraction can only ever be merged with bytes from the same
-/// version. That is the same kind of assertion Mode B rests on.
-///
-/// This asserts the authority is really on the wire rather than trusting the comment
-/// that says so. Without it, the reachability change would rest on a code reading —
-/// and this is exactly the class of arm that gets missed when a lookup's semantics
-/// change underneath it.
+/// The observable is the captured upstream request: it must carry neither a
+/// `Range` nor an `If-Match` the client did not send.
 ///
 /// Requirements: 1.2, 4.7, 7.11.
 #[tokio::test]
-async fn expired_partial_coverage_full_object_merge_is_pinned_to_the_cached_etag() {
+async fn expired_partial_coverage_full_object_get_forwards_the_clients_request() {
     let config = test_config_full_object_checks_with_get_ttl(OBJECT_SIZE, Duration::ZERO);
     let fixture = Fixture::new(config).await;
     let key = format!("{}/partial-{}", BUCKET, OBJECT);
     let path = format!("/{}", key);
 
-    // Cache the first half only, well above the path's 10%-cached gate.
+    // Cache the first half only, so coverage is partial.
     let cached_end = OBJECT_SIZE / 2 - 1;
     let etag = fixture.seed(
         &key,
@@ -366,25 +357,12 @@ async fn expired_partial_coverage_full_object_merge_is_pinned_to_the_cached_etag
     );
     fixture.invalidate_metadata_cache(&key).await;
 
-    // Every upstream answer is FRESH bytes, so the cached half is identifiable in the
-    // merged response by value.
-    let stub = StubS3Client::new().with_default(
-        StubResponse::with_status(StatusCode::PARTIAL_CONTENT)
-            .with_body(Bytes::from(new_bytes()))
-            .with_header(
-                "content-range",
-                format!("bytes 0-{}/{}", OBJECT_SIZE - 1, OBJECT_SIZE),
-            )
-            .with_header("etag", &etag),
-    );
+    let stub = StubS3Client::new()
+        .with_default(StubResponse::ok(Bytes::from(new_bytes())).with_header("etag", &etag));
     let server = fixture.spawn_proxy(stub.clone().into_trait_object()).await;
 
-    // The Authorization here must NOT sign `range`: the merge path synthesises a Range
-    // to fetch the gaps and refuses to when `range` is signed, because adding the
-    // header would break the client's signature. With the range-signing fixture the
-    // path is simply not entered — which is how the first version of this test failed,
-    // capturing a request with neither `range` nor `if-match` on it.
-    let (_status, _headers, body) = proxy_get_with_auth(
+    // `range` unsigned, as for any plain GET, so a synthesized Range would be allowed.
+    let (status, headers, body) = proxy_get_with_auth(
         server.addr,
         &path,
         &signed_authorization_without_range(),
@@ -393,44 +371,27 @@ async fn expired_partial_coverage_full_object_merge_is_pinned_to_the_cached_etag
     .await;
     let captured = stub.captured();
 
-    // Precondition: something actually went upstream. If the whole response came from
-    // cache this test would be asserting about a request that never happened.
     assert!(
         !captured.is_empty(),
-        "PRECONDITION MISSING: no upstream request was made, so there is no merge to \
-         inspect. Response was {}",
+        "PRECONDITION MISSING: no upstream request was made. Response was {}",
         fill_summary(&body)
     );
-
-    // Precondition, learned the hard way: the merge path must actually have been
-    // entered. It synthesises a Range to fetch only the gaps, so a captured request
-    // with no `range` header means the request took the plain-forward path and this
-    // test is about to assert on the wrong request shape.
     assert!(
-        captured
-            .iter()
-            .any(|r| r.headers.contains_key("range") || r.headers.contains_key("Range")),
-        "PRECONDITION MISSING: no upstream request carried a synthesised Range, so the \
-         partial-merge path was not entered and there is nothing for the If-Match \
-         assertion below to be about. Captured requests: {:#?}",
+        captured.iter().all(|r| {
+            !r.headers.contains_key("range")
+                && !r.headers.contains_key("Range")
+                && !r.headers.contains_key("if-match")
+                && !r.headers.contains_key("If-Match")
+        }),
+        "R1.2: the client's request must be forwarded without a Range or If-Match it \
+         did not send. Captured requests: {:#?}",
         captured
     );
-
-    // THE authority assertion. Reads the header off the request that actually fetched
-    // the bytes, not a different one.
-    let pinned = captured.iter().any(|r| {
-        r.headers
-            .get("if-match")
-            .or_else(|| r.headers.get("If-Match"))
-            .map(|v| v == &etag)
-            .unwrap_or(false)
-    });
-    assert!(
-        pinned,
-        "R1.2: the partial-merge path serves the EXPIRED cached fraction, so the fetch \
-         of the missing bytes must be pinned to the cached ETag ({}) — otherwise the \
-         merged response could splice two different versions of the object together \
-         and no authority would cover the cached half. Captured requests: {:#?}",
-        etag, captured
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers.get("content-range").is_none());
+    assert_all_new(
+        &body,
+        OBJECT_SIZE as usize,
+        "a partially covered full-object GET serves the whole response S3 returned",
     );
 }

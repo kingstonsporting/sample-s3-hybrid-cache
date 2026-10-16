@@ -699,8 +699,10 @@ When only some bytes of a requested range are cached and the rest must be fetche
 Partial cache hit → Fetch missing bytes with injected If-Match
   → 200/206: merge cached + fresh bytes, serve, cache missing
   → 412: object changed on S3 → invalidate all cached ranges for the key,
-         retry the fetch once WITHOUT the injected If-Match, serve fresh data
+         forward the client's request once WITHOUT the injected If-Match, serve fresh data
 ```
+
+The retry carries the client's own `Range`, so S3 resolves a suffix or open-ended range against the object as it is now rather than against the stale cached size.
 
 The client never sees the 412 caused by the proxy-injected header. A client-supplied `If-Match` is always preserved verbatim and its 412 is passed through.
 

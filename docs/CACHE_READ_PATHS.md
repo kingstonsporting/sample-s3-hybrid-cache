@@ -97,13 +97,11 @@ The proxy implements intelligent range merging to optimize partial cache hits. W
 
 #### Full-Object GETs with Partial Cache Coverage
 
-A GET without a `Range` header whose cache has partial coverage can also benefit from the merge path. The proxy synthesizes `Range: bytes=0-{total_size-1}` and routes through the same merge machinery, subject to three hard-coded gates:
+A GET without a `Range` header whose cache covers only part of the object is forwarded to S3 unchanged, and the `200` response re-caches the whole object. The proxy does not fetch only the gaps for it: that needs a `Range` the client never sent, bounded by the cached size, and once the object is overwritten S3 resolves that bound against the new version.
 
-1. **Signature preservation**: `range` must not appear in the request's SigV4 SignedHeaders. Since this path synthesizes a Range header on a request that had no Range, and AWS SDKs only sign headers present at signing time, this gate passes trivially for the intended use case (full-object GETs with partial cache coverage).
-2. **Cached fraction ≥ 10 %**: sum of cached range bytes must be at least 10 % of `total_size`.
-3. **Object size ≤ 128 MiB**: the merge path buffers the reconstructed response; a 128 MiB cap avoids memory pressure. Larger objects fall through to an unconditional S3 fetch as before.
+#### Ranges the Cache Cannot Resolve
 
-If any gate fails, the request falls through to an unconditional S3 fetch (pre-1.14.0 behavior). These thresholds are fixed in code, not exposed in configuration.
+A suffix (`bytes=-N`) or open-ended (`bytes=N-`) request for an object whose size is not cached yet is forwarded verbatim, as is a range request sent with `Cache-Control: no-cache`. S3 answers with a `206` for part of the object, which is cached at the offsets its `Content-Range` reports.
 
 #### How Range Merging Works
 

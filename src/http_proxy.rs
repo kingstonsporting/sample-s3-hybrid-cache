@@ -2776,8 +2776,8 @@ impl HttpProxy {
                 // proxy's own `If-Match` on the ETag we just matched — the documented
                 // partial-cache merge pin. It expresses the same "this exact version"
                 // intent, and a changed object now costs a bodyless `412` that
-                // `fetch_complete_range_from_s3`'s sentinel branch already recovers from
-                // (invalidate, retry once without the injected header).
+                // `stream_range_from_s3_with_caching`'s sentinel branch already recovers
+                // from (invalidate, retry once without the injected header).
                 //
                 // Only when `If-Range` is NOT in `SignedHeaders`: stripping a signed header
                 // would invalidate the client's signature. A signed `If-Range` is forwarded
@@ -4160,126 +4160,15 @@ impl HttpProxy {
                             }
                         }
                         Ok(overlap) => {
-                            // Partial cache coverage for a full-object (no-Range) GET.
-                            // If the cached fraction is material and the total size fits
-                            // in memory for buffered merge, synthesize a Range and route
-                            // through the partial-merge path to fetch only the missing bytes.
-                            // Hard-coded gates:
-                            //   - Request's Range header must not be in SignedHeaders
-                            //     (synthesizing a Range would otherwise break the signature).
-                            //     For a no-Range GET, client SignedHeaders normally does
-                            //     not include `range`, but guard defensively.
-                            //   - cached fraction >= 10% of total_size
-                            //   - total_size <= 128 MiB (avoid buffering huge objects)
-                            const PARTIAL_MERGE_MIN_FRACTION_NUMERATOR: u64 = 1;
-                            const PARTIAL_MERGE_MIN_FRACTION_DENOMINATOR: u64 = 10; // 10%
-                            const PARTIAL_MERGE_MAX_SIZE_BYTES: u64 = 128 * 1024 * 1024;
-
-                            let cached_bytes: u64 = overlap
-                                .cached_ranges
-                                .iter()
-                                .map(|r| r.end - r.start + 1)
-                                .sum();
-
-                            let range_is_signed =
-                                crate::signed_request_proxy::is_range_signed(&header_map);
-
-                            let fraction_ok = cached_bytes * PARTIAL_MERGE_MIN_FRACTION_DENOMINATOR
-                                >= total_size * PARTIAL_MERGE_MIN_FRACTION_NUMERATOR;
-                            let size_ok = total_size <= PARTIAL_MERGE_MAX_SIZE_BYTES;
-
-                            if !range_is_signed
-                                && fraction_ok
-                                && size_ok
-                                && total_size > 0
-                                && !forward_to_s3
-                            {
-                                debug!(
-                                    "Full-object partial-merge: cache_key={} total_size={} cached_bytes={} fraction={:.2}% — synthesizing Range and routing through merge path",
-                                    cache_key,
-                                    total_size,
-                                    cached_bytes,
-                                    (cached_bytes as f64 / total_size as f64) * 100.0
-                                );
-
-                                // Synthesize a Range covering the whole object.
-                                let mut synthesized_headers = header_map.clone();
-                                synthesized_headers.retain(|k, _| k.to_lowercase() != "range");
-                                synthesized_headers.insert(
-                                    "Range".to_string(),
-                                    format!("bytes=0-{}", total_size - 1),
-                                );
-
-                                // Build conditional headers to protect the merged response
-                                // against mid-flight ETag drift on S3. build_conditional_headers_for_range
-                                // injects If-Match and If-Unmodified-Since independently, only when
-                                // the client did not already supply each one.
-                                let client_had_if_match =
-                                    synthesized_headers.contains_key("if-match");
-                                let client_had_if_unmodified_since =
-                                    synthesized_headers.contains_key("if-unmodified-since");
-                                let conditional = range_handler
-                                    .build_conditional_headers_for_range(
-                                        &synthesized_headers,
-                                        &overlap.cached_ranges,
-                                    );
-                                for (k, v) in conditional {
-                                    synthesized_headers.insert(k, v);
-                                }
-                                // Mark each proxy-injected precondition so the fetch
-                                // code can strip it and retry without leaking 412.
-                                if !client_had_if_match
-                                    && synthesized_headers.contains_key("if-match")
-                                {
-                                    synthesized_headers.insert(
-                                        "x-proxy-injected-if-match".to_string(),
-                                        "1".to_string(),
-                                    );
-                                }
-                                if !client_had_if_unmodified_since
-                                    && synthesized_headers.contains_key("if-unmodified-since")
-                                {
-                                    synthesized_headers.insert(
-                                        "x-proxy-injected-if-unmodified-since".to_string(),
-                                        "1".to_string(),
-                                    );
-                                }
-
-                                return Self::forward_range_with_coordination(
-                                    method,
-                                    uri,
-                                    host,
-                                    synthesized_headers,
-                                    cache_key,
-                                    full_range,
-                                    overlap,
-                                    cache_manager,
-                                    range_handler,
-                                    s3_client,
-                                    config.clone(),
-                                    false, // not signed (guarded above)
-                                    preloaded_metadata.as_ref(),
-                                    inflight_tracker,
-                                    metrics_manager,
-                                    &resolved_settings,
-                                    proxy_referer,
-                                    permit,
-                                )
-                                .await;
-                            }
-
+                            // Not servable from cache (partial coverage, or S3 must evaluate
+                            // the request): forward the client's own request, whose 200
+                            // re-caches the whole object. Fetching only the gaps needs a
+                            // Range the client never sent, bounded by the cached size; after
+                            // an overwrite S3 answers it with that many bytes of the new
+                            // version, which truncates a larger object.
                             debug!(
-                                "Partial cache coverage for full object, skipping merge: cache_key={} total_size={} cached_bytes={} fraction={:.2}% size_ok={} signed={}",
-                                cache_key,
-                                total_size,
-                                cached_bytes,
-                                if total_size > 0 {
-                                    (cached_bytes as f64 / total_size as f64) * 100.0
-                                } else {
-                                    0.0
-                                },
-                                size_ok,
-                                range_is_signed
+                                "Full object GET not servable from cache, forwarding the client's request: cache_key={} total_size={} fully_cached={} forward_to_s3={}",
+                                cache_key, total_size, overlap.can_serve_from_cache, forward_to_s3
                             );
                         }
                         Err(e) => {
@@ -12586,6 +12475,13 @@ impl HttpProxy {
                         .unwrap());
                 }
 
+                // The request can carry a Range, one the cache could not resolve (a cold
+                // `bytes=-N`) or one sent with `Cache-Control: no-cache`, which S3 answers
+                // with a 206 for part of the object. A body is cached only at the offsets
+                // its response reports, or as a part.
+                let cached_extent = Self::response_extent(&s3_response);
+                let is_part_request = uri.query().is_some_and(|q| q.contains("partNumber"));
+
                 // GET requests: handle streaming vs buffered
                 match s3_response.body {
                     Some(S3ResponseBody::Streaming(incoming)) => {
@@ -12619,7 +12515,7 @@ impl HttpProxy {
                             // reuse them here instead of re-resolving (Requirement 8.2).
                             let get_ttl = resolved.get_ttl;
 
-                            // Extract content_length for incremental write range bounds
+                            // Body length, for the compression decision and the download throttle
                             let content_length: Option<u64> = response_headers
                                 .get("content-length")
                                 .and_then(|v| v.parse::<u64>().ok());
@@ -12652,22 +12548,21 @@ impl HttpProxy {
                                 // Held for the task's lifetime; dropped at task exit, releasing
                                 // this share of the Owned_Permit (TCA 2.2, 2.5).
                                 let _spawn_permit = spawn_permit;
-                                // Check if this is a part-number request (needs special handling)
-                                let is_part_request = uri_clone
-                                    .query()
-                                    .map(|q| q.contains("partNumber"))
-                                    .unwrap_or(false);
 
-                                // Use incremental writes for regular GET responses with known content_length
-                                #[allow(clippy::unnecessary_unwrap)]
-                                if !is_part_request
-                                    && content_length.is_some()
-                                    && content_length.unwrap() > 0
+                                if !is_part_request && cached_extent.is_none() {
+                                    // No extent to cache the body under; the client still
+                                    // gets it, as TeeStream outlives the closed channel.
+                                    if let Some(guard) = spawn_guard {
+                                        guard.complete_success();
+                                    }
+                                    return;
+                                }
+
+                                // Use incremental writes for responses with a known extent;
+                                // part-number requests need special handling below.
+                                if let (false, Some((start, end))) =
+                                    (is_part_request, cached_extent)
                                 {
-                                    let total_size = content_length.unwrap();
-                                    let start = 0u64;
-                                    let end = total_size - 1;
-
                                     // Begin incremental write
                                     let disk_cache =
                                         range_handler_clone.get_disk_cache_manager().read().await;
@@ -12781,8 +12676,8 @@ impl HttpProxy {
                                         }
                                     } else {
                                         debug!(
-                                            "Cached streamed GET response via incremental write: cache_key={}, size={} bytes",
-                                            cache_key_clone, total_size
+                                            "Cached streamed GET response via incremental write: cache_key={}, range={}-{}",
+                                            cache_key_clone, start, end
                                         );
                                         // Cache entry committed and visible — release coordination guard
                                         if let Some(guard) = spawn_guard {
@@ -12790,7 +12685,7 @@ impl HttpProxy {
                                         }
                                     }
                                 } else {
-                                    // Fallback: part-number requests or unknown content_length — accumulate then cache
+                                    // Fallback: part-number requests — accumulate then cache
                                     //
                                     // Unknown_Size_Site: the final size is not known up front, so
                                     // the Reservation grows per received chunk via `try_grow`
@@ -12989,7 +12884,7 @@ impl HttpProxy {
                     }
                     Some(S3ResponseBody::Buffered(bytes)) => {
                         // Buffered response (small) - cache synchronously
-                        if status.is_success() {
+                        if status == StatusCode::OK || (is_part_request && status.is_success()) {
                             let body_size = bytes.len() as u64;
                             debug!("GET response has body of size: {} bytes", body_size);
 
@@ -13026,6 +12921,11 @@ impl HttpProxy {
                                 if let Some(guard) = coordination_guard {
                                     guard.complete_success();
                                 }
+                            }
+                        } else if status.is_success() {
+                            // A partial response with no extent is served but not cached
+                            if let Some(guard) = coordination_guard {
+                                guard.complete_success();
                             }
                         } else {
                             // Non-success buffered response — release guard with error
@@ -14115,22 +14015,19 @@ impl HttpProxy {
             }
             Err(e) => {
                 Self::log_s3_forward_error(&uri, &method, &e);
-                if let Some(guard) = coordination_guard {
-                    guard.complete_error(format!("S3 fetch failed: {}", e));
-                }
-                // Fall back to complete S3 fetch - Requirement 2.5
-                Self::fetch_complete_range_from_s3(
+                // Fall back to fetching the client's whole range - Requirement 2.5
+                Self::stream_range_from_s3_with_caching(
                     method,
                     uri,
                     host,
                     headers,
                     cache_key,
                     range_spec,
-                    cache_manager,
                     range_handler,
                     s3_client,
                     config,
                     resolved,
+                    coordination_guard,
                     permit.clone(),
                 )
                 .await
@@ -14360,144 +14257,6 @@ impl HttpProxy {
                     "Failed to forward range request to S3",
                 ))
             }
-        }
-    }
-
-    /// Fetch complete range from S3 as fallback when merge fails
-    #[allow(clippy::too_many_arguments)]
-    async fn fetch_complete_range_from_s3(
-        method: Method,
-        uri: hyper::Uri,
-        host: String,
-        headers: HashMap<String, String>,
-        cache_key: String,
-        range_spec: RangeSpec,
-        _cache_manager: Arc<CacheManager>,
-        range_handler: Arc<RangeHandler>,
-        s3_client: Arc<dyn S3ClientApi + Send + Sync>,
-        config: Arc<Config>,
-        resolved: &crate::bucket_settings::ResolvedSettings,
-        permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    ) -> std::result::Result<Response<BoxBody<Bytes, hyper::Error>>, Infallible> {
-        debug!(
-            "Fetching complete range {}-{} from S3 as fallback",
-            range_spec.start, range_spec.end
-        );
-
-        // Build S3 request context with range header
-        let mut s3_headers = headers.clone();
-        // Remove any existing Range header (case-insensitive) to avoid duplicates
-        s3_headers.retain(|k, _| k.to_lowercase() != "range");
-        // Insert new Range header with proper capitalization
-        s3_headers.insert(
-            "Range".to_string(),
-            format!("bytes={}-{}", range_spec.start, range_spec.end),
-        );
-
-        // Strip the internal sentinels before sending to S3.
-        let proxy_injected_if_match = s3_headers.remove("x-proxy-injected-if-match").is_some();
-        let proxy_injected_if_unmodified_since = s3_headers
-            .remove("x-proxy-injected-if-unmodified-since")
-            .is_some();
-
-        let context =
-            build_s3_request_context(method.clone(), uri.clone(), s3_headers, None, host.clone());
-
-        match s3_client.forward_request(context).await {
-            Ok(s3_response) => {
-                debug!(
-                    "Successfully received range response from S3: {}",
-                    s3_response.status
-                );
-
-                if s3_response.status == StatusCode::PARTIAL_CONTENT {
-                    // Use the new streaming with caching function
-                    Self::convert_s3_response_to_http_with_caching(
-                        s3_response,
-                        cache_key.clone(),
-                        range_spec.clone(),
-                        range_handler.clone(),
-                        s3_client.clone(),
-                        config.clone(),
-                        resolved,
-                        None,
-                        permit,
-                    )
-                    .await
-                } else if s3_response.status == StatusCode::PRECONDITION_FAILED
-                    && (proxy_injected_if_match || proxy_injected_if_unmodified_since)
-                {
-                    // Proxy-injected precondition rejected by S3. Invalidate stale cache
-                    // and retry once without the injected headers. See
-                    // stream_range_from_s3_with_caching for the same pattern.
-                    warn!(
-                        "S3 returned 412 on proxy-injected precondition (fallback path, injected_if_match={}, injected_if_unmodified_since={}); invalidating cache and retrying: cache_key={}",
-                        proxy_injected_if_match, proxy_injected_if_unmodified_since, cache_key
-                    );
-                    {
-                        let disk_cache = range_handler.get_disk_cache_manager().read().await;
-                        if let Err(e) = range_handler
-                            .get_cache_manager()
-                            .invalidate_ram_ranges(&cache_key)
-                            .await
-                        {
-                            warn!(
-                                "Failed to invalidate stale RAM ranges after 412 retry (fallback): cache_key={}, error={}",
-                                cache_key, e
-                            );
-                        }
-                        if let Err(e) = disk_cache.invalidate_all_ranges(&cache_key).await {
-                            warn!(
-                                "Failed to invalidate stale cache after 412 retry (fallback): cache_key={}, error={}",
-                                cache_key, e
-                            );
-                        }
-                    }
-                    let mut retry_headers = headers.clone();
-                    if proxy_injected_if_match {
-                        retry_headers.remove("if-match");
-                    }
-                    if proxy_injected_if_unmodified_since {
-                        retry_headers.remove("if-unmodified-since");
-                    }
-                    retry_headers.remove("x-proxy-injected-if-match");
-                    retry_headers.remove("x-proxy-injected-if-unmodified-since");
-                    Box::pin(Self::fetch_complete_range_from_s3(
-                        method,
-                        uri,
-                        host,
-                        retry_headers,
-                        cache_key,
-                        range_spec,
-                        _cache_manager,
-                        range_handler,
-                        s3_client,
-                        config,
-                        resolved,
-                        permit,
-                    ))
-                    .await
-                } else if s3_response.status == StatusCode::PRECONDITION_FAILED {
-                    // Client sent their own If-Match and S3 rejected it. Pass 412 through.
-                    warn!("S3 returned 412 Precondition Failed, returning to client without invalidating cache");
-
-                    Ok(Self::build_error_response(
-                        StatusCode::PRECONDITION_FAILED,
-                        "PreconditionFailed",
-                        "Precondition failed",
-                        None,
-                    ))
-                } else {
-                    // Forward the S3 error response
-                    Self::convert_s3_response_to_http(s3_response, permit)
-                }
-            }
-            Err(e) => Ok(Self::s3_forward_error_response(
-                &uri,
-                &method,
-                &e,
-                "Failed to forward range request to S3",
-            )),
         }
     }
 
